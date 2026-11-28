@@ -104,8 +104,11 @@ Every axial layer pairs one local and one chunk-wide contraction:
 | odd  | windowed time contraction over `time_window` frames | chunk-wide affinity |
 
 Windowed layers alternate a half-window shift so window seams move between layers.
-In causal mode, time blocks use the exact full-prefix contraction and freq blocks use
-frame-local affinity.
+In causal mode, time blocks contract over an exponentially decayed causal prefix and
+frequency blocks pool their band affinity over the same kind of decayed prefix
+(`CausalFreqTriangleRoPEBlock`), each with a learnable per-channel decay whose
+half-lives are initialized log-spaced (multi-scale memory). `causal_decay=False`
+uses the plain running mean instead.
 
 #### Log-frequency RoPE
 
@@ -113,6 +116,30 @@ Frequency-axis blocks rotate half of their RoPE pairs by **log-frequency positio
 (`12 * log2(hz / 20)`, semitones), so a harmonic ratio such as an octave is the same
 relative offset for every fundamental, and the other half by band index (linear
 harmonic-comb spacing). This is why `TriangleRoFormer2D` requires `band_freqs_hz`.
+
+#### Separation-oriented options
+
+All on by default except `band_embedding`:
+
+| option | what it does |
+|---|---|
+| `soft_norm=True`, `norm_floor_init=0.5` | Time transfer matrices and frequency affinity logits are divided by `sqrt(rms² + floor²/n)` rather than by their own RMS (`n` = frames pooled, `floor` learnable per channel). Sampling noise of a mean over `n` frames scales like `1/sqrt(n)`, so the floor sits at the noise level for every window size and chunk length: noise-level correlations stay weak instead of being rescaled to look like strong ones. |
+| `attn_sink=True` | Every frequency softmax gets a learnable per-channel null logit with a zero value, so a band can attend to "nothing" (e.g. when the target source is absent) instead of averaging other bands. |
+| `causal_decay=True` | Causal mode only: decayed prefix (see above). |
+| `band_embedding=False` | Optional zero-initialized `[F, dim]` absolute band embedding. Unnecessary if the front end already uses per-band projections. |
+
+`soft_norm=False, attn_sink=False` reproduce the 0.2.x non-causal blocks and load
+their checkpoints unchanged. The one difference is that shifted windowed-frequency
+edge windows now average over their real frame count instead of the full window.
+
+#### Padding mask
+
+```python
+# frame_mask: [B, T], 1 = real frame. Padded frames are excluded from every
+# time-pooled statistic (chunk-wide, windowed, causal prefix, boundary-block GRN),
+# so real frames get the same output as for the unpadded input.
+out = encoder(tokens, frame_mask=frame_mask)
+```
 
 ## Running Tests
 

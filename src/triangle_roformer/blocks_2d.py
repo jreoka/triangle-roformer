@@ -9,6 +9,71 @@ import torch.nn.functional as F
 from .rope import RotaryEmbedding
 
 
+_FLOOR_MIN = 1e-3
+_FLOOR_MAX = 10.0
+
+
+def _decay_logit_init(
+    channels: int, min_half_life: float, max_half_life: float
+) -> torch.Tensor:
+    """Per-channel decay logits whose half-lives (in frames) are log-spaced
+    between `min_half_life` and `max_half_life` (multi-scale memory)."""
+    half_life = torch.logspace(
+        math.log10(min_half_life), math.log10(max_half_life), channels
+    )
+    gamma = torch.pow(2.0, -1.0 / half_life)
+    return torch.log(gamma) - torch.log1p(-gamma)
+
+
+def _decay_weights(
+    log_gamma: torch.Tensor | None,
+    length: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Intra-chunk decay weights for a decayed prefix sum.
+
+    Returns `w [M', L, L]` with `w[m, j, i] = gamma_m^(j - i)` for `i <= j` (else 0)
+    and `carry [M', L]` with `carry[m, j] = gamma_m^(j + 1)` (weight of the state
+    carried in from previous chunks). `log_gamma=None` means no decay (`M' = 1`),
+    which reduces to a plain cumulative sum.
+    """
+    idx = torch.arange(length, device=device, dtype=torch.float32)
+    lag = idx[:, None] - idx[None, :]
+    lower = lag >= 0
+    if log_gamma is None:
+        return lower.float()[None], torch.ones(1, length, device=device)
+    lg = log_gamma.float().to(device)
+    w = torch.where(
+        lower[None], torch.exp(lg.view(-1, 1, 1) * lag.clamp_min(0.0)[None]), 0.0
+    )
+    carry = torch.exp(lg.view(-1, 1) * (idx + 1.0)[None])
+    return w, carry
+
+
+def _decayed_chunk_scan(
+    delta: torch.Tensor,
+    valid: torch.Tensor,
+    w: torch.Tensor,
+    carry: torch.Tensor,
+    state: torch.Tensor,
+    count: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decayed causal prefix sums over one chunk.
+
+    delta: `[B, M, L, *rest]` per-frame terms (fp32), valid: `[B, L]` frame weights,
+    state: `[B, M, *rest]` carried sum, count: `[B, M]` carried weight.
+    Returns `cum [B, M, L, *rest]` and `n [B, M, L]` (decayed valid-frame counts).
+    """
+    batch, m_ch, length = delta.shape[:3]
+    rest = delta.shape[3:]
+    w = w.expand(m_ch, length, length)
+    flat = delta.reshape(batch, m_ch, length, -1)
+    cum = torch.einsum("mji,bmir->bmjr", w, flat)
+    cum = cum + carry[None, :, :, None] * state.reshape(batch, m_ch, 1, -1)
+    n = torch.einsum("mji,bi->bmj", w, valid) + carry[None] * count[:, :, None]
+    return cum.reshape(batch, m_ch, length, *rest), n
+
+
 def _resolve_tri_dim(
     dim: int,
     tri_dim: int | None,
@@ -44,6 +109,20 @@ class TriangleRoPEBlock(nn.Module):
     positions (semitones, see `rope.log_frequency_positions`). Half of the rotary
     pairs rotate by log-frequency (pitch-invariant harmonic ratios) and half by
     band index (linear harmonic-comb spacing).
+
+    Separation-oriented options:
+      - `soft_norm`: transfer matrices / affinity logits are normalized by
+        `sqrt(rms^2 + floor^2 / n)` instead of by their own RMS, where `n` is the
+        number of frames pooled and `floor` is a learnable per-channel parameter
+        (`norm_floor_init`). The sampling noise of a mean over `n` frames scales
+        like `1 / sqrt(n)`, so the floor sits at the noise level for every window
+        size / chunk length: weak (noise-level) correlations stay weak instead of
+        being rescaled to the same magnitude as strong ones.
+      - `attn_sink` (frequency axis): a learnable per-channel null logit with a
+        zero value, so a band can attend to "nothing" (e.g. when the target
+        source is absent) instead of being forced to average other bands.
+      - `frame_mask` (forward arg, `[B, T]`, 1 = real frame): padded frames are
+        excluded from all time-pooled statistics.
     """
 
     def __init__(
@@ -59,6 +138,9 @@ class TriangleRoPEBlock(nn.Module):
         dropout: float = 0.0,
         residual_scale: float = 1.0,
         freq_positions: torch.Tensor | None = None,
+        soft_norm: bool = True,
+        norm_floor_init: float = 0.5,
+        attn_sink: bool = True,
     ):
         super().__init__()
         resolved_tri_dim = _resolve_tri_dim(dim, tri_dim, heads)
@@ -70,6 +152,11 @@ class TriangleRoPEBlock(nn.Module):
             )
         if freq_window < 0:
             raise ValueError(f"freq_window must be non-negative, got {freq_window}.")
+        if soft_norm and not _FLOOR_MIN <= norm_floor_init <= _FLOOR_MAX:
+            raise ValueError(
+                f"norm_floor_init must be in [{_FLOOR_MIN}, {_FLOOR_MAX}], "
+                f"got {norm_floor_init}."
+            )
         if window_shift < 0 or (freq_window > 0 and window_shift >= freq_window):
             raise ValueError(
                 f"window_shift ({window_shift}) must be in [0, freq_window)."
@@ -104,6 +191,16 @@ class TriangleRoPEBlock(nn.Module):
             self.register_buffer("freq_cos", None, persistent=False)
             self.register_buffer("freq_sin", None, persistent=False)
             self.register_parameter("freq_scale", None)
+        if soft_norm:
+            self.log_norm_floor = nn.Parameter(
+                torch.full((resolved_tri_dim // 2,), math.log(norm_floor_init))
+            )
+        else:
+            self.register_parameter("log_norm_floor", None)
+        if axis == "freq" and attn_sink:
+            self.sink_logit = nn.Parameter(torch.zeros(resolved_tri_dim // 2))
+        else:
+            self.register_parameter("sink_logit", None)
         self.tri_out_norm = nn.RMSNorm(resolved_tri_dim)
         self.tri_out = nn.Linear(resolved_tri_dim, dim, bias=False)
 
@@ -139,11 +236,79 @@ class TriangleRoPEBlock(nn.Module):
         c = self.c_norm(c_val) * torch.sigmoid(c_gate)
         return a, b, c, out_gate
 
+    @staticmethod
+    def _mask_abc(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        c: torch.Tensor,
+        frame_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Zero (a, b, c) on padded frames; returns them plus `valid [B, T]` (fp32)."""
+        if frame_mask is None:
+            valid = torch.ones(a.shape[0], a.shape[1], device=a.device)
+            return a, b, c, valid
+        valid = frame_mask.to(device=a.device, dtype=torch.float32)
+        m = valid.to(dtype=a.dtype)[:, :, None, None]
+        return a * m, b * m, c * m, valid
+
+    def _channel_view(self, param: torch.Tensor, ndim: int) -> torch.Tensor:
+        """Reshape a per-channel `[M]` parameter to broadcast over dim 1 of an `ndim` tensor."""
+        return param.float().view(1, -1, *([1] * (ndim - 2)))
+
+    def _floor_sq(
+        self, ndim: int, inv_count: torch.Tensor
+    ) -> torch.Tensor | float:
+        """Squared normalization floor `floor^2 / n` (or the plain eps without
+        `soft_norm`). `inv_count` (fp32, `1 / n`) must broadcast to the stats."""
+        if self.log_norm_floor is None:
+            return 1e-6
+        floor = self.log_norm_floor.float().exp().clamp(_FLOOR_MIN, _FLOOR_MAX)
+        return self._channel_view(floor.square(), ndim) * inv_count + 1e-6
+
+    def _normalize_kernel(
+        self, k_r: torch.Tensor, k_i: torch.Tensor, inv_count: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Phase-preserving joint normalization of `(K_r, K_i)` over source bands
+        (dim -2). With `soft_norm`, divides by `sqrt(ms + floor^2 / n)` so the
+        kernel keeps its correlation strength when it is near the noise level."""
+        ms = (k_r.float().square() + k_i.float().square()).mean(dim=-2, keepdim=True)
+        scale = torch.rsqrt(ms + self._floor_sq(ms.ndim, inv_count))
+        return k_r * scale.to(dtype=k_r.dtype), k_i * scale.to(dtype=k_i.dtype)
+
+    def _freq_attention(self, m: torch.Tensor, inv_count: torch.Tensor) -> torch.Tensor:
+        """Softmax over the last (source band) axis of a `[B, M, ..., F, F]`
+        affinity, with optional soft normalization and a null (sink) logit."""
+        assert self.freq_scale is not None
+        m_f = m.float()
+        ms = m_f.square().mean(dim=-1, keepdim=True)
+        scale = self._channel_view(self.freq_scale.clamp(0.1, 20.0), m_f.ndim)
+        logits = m_f * torch.rsqrt(ms + self._floor_sq(m_f.ndim, inv_count)) * scale
+        if self.sink_logit is None:
+            return F.softmax(logits, dim=-1)
+        sink = self._channel_view(self.sink_logit, m_f.ndim).expand(
+            *logits.shape[:-1], 1
+        )
+        return F.softmax(torch.cat((logits, sink), dim=-1), dim=-1)[..., :-1]
+
     def _apply_freq_rope(
         self, a: torch.Tensor, b: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self.freq_cos is not None and self.freq_sin is not None
         return self.rope.apply_freq_tables(a, b, self.freq_cos, self.freq_sin)
+
+    @staticmethod
+    def _window_inv_counts(
+        valid: torch.Tensor, shift: int, pad_right: int, win: int
+    ) -> torch.Tensor:
+        """`[B, 1, num_win, 1, 1]` (fp32) reciprocal count of real frames per window."""
+        valid_p = F.pad(valid, (shift, pad_right))
+        counts = valid_p.reshape(valid.shape[0], -1, win).sum(dim=-1).clamp_min(1.0)
+        return (1.0 / counts)[:, None, :, None, None]
+
+    @staticmethod
+    def _global_inv_count(valid: torch.Tensor) -> torch.Tensor:
+        """`[B, 1, 1, 1]` (fp32) reciprocal count of real frames in the chunk."""
+        return (1.0 / valid.sum(dim=1).clamp_min(1.0)).view(-1, 1, 1, 1)
 
     def _finish_block(
         self,
@@ -168,11 +333,15 @@ class TimeTriangleRoPEBlock(TriangleRoPEBlock):
     Non-causal (`causal=False`):
         K_r[f', f] = (1/T) * sum_{t'} b_r[t', f'] * c[t', f]
         K_i[f', f] = (1/T) * sum_{t'} b_i[t', f'] * c[t', f]
-    with phase-preserving joint RMS normalization on (K_r, K_i) before
+    with phase-preserving joint (soft) RMS normalization on (K_r, K_i) before
         O[t, f] = (1/sqrt(F)) * sum_{f'} (a_r[t, f'] * K_r[f', f] + a_i[t, f'] * K_i[f', f]).
 
     Causal (`causal=True`):
         Computes the exact prefix contraction over t' <= t in chunks of `chunk_size`.
+        With `causal_decay=True` (default) the prefix is an exponentially decayed
+        mean with a learnable per-channel decay (half-lives initialized log-spaced
+        over `decay_half_life` frames), so recent frames are not diluted by the
+        whole history; with `causal_decay=False` it is the plain running mean.
     """
 
     def __init__(
@@ -186,6 +355,10 @@ class TimeTriangleRoPEBlock(TriangleRoPEBlock):
         rope_base: float = 10_000.0,
         dropout: float = 0.0,
         residual_scale: float = 1.0,
+        soft_norm: bool = True,
+        norm_floor_init: float = 0.5,
+        causal_decay: bool = True,
+        decay_half_life: tuple[float, float] = (4.0, 4096.0),
     ):
         super().__init__(
             dim=dim,
@@ -196,11 +369,19 @@ class TimeTriangleRoPEBlock(TriangleRoPEBlock):
             rope_base=rope_base,
             dropout=dropout,
             residual_scale=residual_scale,
+            soft_norm=soft_norm,
+            norm_floor_init=norm_floor_init,
         )
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
         self.causal = causal
         self.chunk_size = chunk_size
+        if causal and causal_decay:
+            self.time_decay_logit = nn.Parameter(
+                _decay_logit_init(self.heads, *decay_half_life)
+            )
+        else:
+            self.register_parameter("time_decay_logit", None)
 
     def _causal_forward(
         self,
@@ -209,20 +390,26 @@ class TimeTriangleRoPEBlock(TriangleRoPEBlock):
         b_r: torch.Tensor,
         b_i: torch.Tensor,
         c_cat: torch.Tensor,
+        valid: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch, m_ch, frames, bands = a_r.shape
         two_f = c_cat.shape[-1]
         inv_sqrt_f = 1.0 / math.sqrt(bands)
-
-        s_r = torch.zeros(
-            batch, m_ch, bands, two_f, device=a_r.device, dtype=torch.float32
+        log_gamma = (
+            None
+            if self.time_decay_logit is None
+            else F.logsigmoid(self.time_decay_logit.float())
         )
-        s_i = torch.zeros_like(s_r)
+
+        state = torch.zeros(
+            batch, m_ch, bands, 2 * two_f, device=a_r.device, dtype=torch.float32
+        )
+        count = torch.zeros(batch, m_ch, device=a_r.device, dtype=torch.float32)
         outputs: list[torch.Tensor] = []
 
         for start in range(0, frames, self.chunk_size):
             end = min(start + self.chunk_size, frames)
-            chunk_len = end - start
+            w, carry = _decay_weights(log_gamma, end - start, a_r.device)
 
             ar_c = a_r[:, :, start:end, :].float()
             ai_c = a_i[:, :, start:end, :].float()
@@ -230,28 +417,18 @@ class TimeTriangleRoPEBlock(TriangleRoPEBlock):
             bi_c = b_i[:, :, start:end, :].float()
             c_c = c_cat[:, :, start:end, :].float()
 
-            delta_r = br_c.unsqueeze(-1) * c_c.unsqueeze(-2)
-            delta_i = bi_c.unsqueeze(-1) * c_c.unsqueeze(-2)
-
-            cum_r = s_r.unsqueeze(2) + torch.cumsum(delta_r, dim=2)
-            cum_i = s_i.unsqueeze(2) + torch.cumsum(delta_i, dim=2)
-            s_r = cum_r[:, :, -1]
-            s_i = cum_i[:, :, -1]
-
-            denom = torch.arange(
-                start + 1, end + 1, device=a_r.device, dtype=torch.float32
-            ).view(1, 1, chunk_len, 1, 1)
-            kr_c = cum_r / denom
-            ki_c = cum_i / denom
-
-            k_rms = (
-                (kr_c.square() + ki_c.square())
-                .mean(dim=-2, keepdim=True)
-                .add(1e-6)
-                .sqrt()
+            delta = torch.cat(
+                (br_c.unsqueeze(-1) * c_c.unsqueeze(-2), bi_c.unsqueeze(-1) * c_c.unsqueeze(-2)),
+                dim=-1,
+            )  # [B, M, L, F, 4F] = (real | imag)
+            cum, n = _decayed_chunk_scan(
+                delta, valid[:, start:end], w, carry, state, count
             )
-            kr_c = kr_c / k_rms
-            ki_c = ki_c / k_rms
+            state = cum[:, :, -1]
+            count = n[:, :, -1]
+
+            inv_n = 1.0 / n.clamp_min(1e-6)[..., None, None]
+            kr_c, ki_c = self._normalize_kernel(*(cum * inv_n).chunk(2, dim=-1), inv_n)
 
             o_c = (
                 torch.matmul(ar_c.unsqueeze(-2), kr_c).squeeze(-2)
@@ -262,9 +439,12 @@ class TimeTriangleRoPEBlock(TriangleRoPEBlock):
         o_cat = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=2)
         return o_cat.chunk(2, dim=-1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _batch, frames, bands, _dim = x.shape
+    def forward(
+        self, x: torch.Tensor, frame_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        _batch, _frames, bands, _dim = x.shape
         a, b, c, out_gate = self._project_abc(x)
+        a, b, c, valid = self._mask_abc(a, b, c, frame_mask)
 
         a_r, a_i, b_r, b_i = self.rope.apply_time(a, b)
         c_0, c_1 = c.chunk(2, dim=-1)
@@ -278,22 +458,14 @@ class TimeTriangleRoPEBlock(TriangleRoPEBlock):
 
         c_cat = torch.cat((c_0, c_1), dim=-1)  # [B, M, T, 2*F]
         if self.causal:
-            o_0, o_1 = self._causal_forward(a_r, a_i, b_r, b_i, c_cat)
+            o_0, o_1 = self._causal_forward(a_r, a_i, b_r, b_i, c_cat, valid)
             return self._finish_block(x, o_0, o_1, out_gate)
 
-        inv_t = 1.0 / frames
+        inv_t = self._global_inv_count(valid)
         inv_sqrt_f = 1.0 / math.sqrt(bands)
-        k_r = torch.matmul(b_r.transpose(-2, -1), c_cat) * inv_t
-        k_i = torch.matmul(b_i.transpose(-2, -1), c_cat) * inv_t
-        k_rms = (
-            (k_r.float().square() + k_i.float().square())
-            .mean(dim=-2, keepdim=True)
-            .add(1e-6)
-            .sqrt()
-            .to(dtype=k_r.dtype)
-        )
-        k_r = k_r / k_rms
-        k_i = k_i / k_rms
+        k_r = torch.matmul(b_r.transpose(-2, -1), c_cat) * inv_t.to(dtype=c_cat.dtype)
+        k_i = torch.matmul(b_i.transpose(-2, -1), c_cat) * inv_t.to(dtype=c_cat.dtype)
+        k_r, k_i = self._normalize_kernel(k_r, k_i, inv_t)
         o_cat = (torch.matmul(a_r, k_r) + torch.matmul(a_i, k_i)) * inv_sqrt_f
         o_0, o_1 = o_cat.chunk(2, dim=-1)
         return self._finish_block(x, o_0, o_1, out_gate)
@@ -306,7 +478,7 @@ class WindowedTimeTriangleRoPEBlock(TriangleRoPEBlock):
     left pad of `window_shift`). Each window w gets its own transfer matrix
         K_r^w[f', f] = (1/|w|) * sum_{t' in w} b_r[t', f'] * c[t', f]
         K_i^w[f', f] = (1/|w|) * sum_{t' in w} b_i[t', f'] * c[t', f]
-    (joint RMS-normalized as in `TimeTriangleRoPEBlock`) and
+    (jointly normalized as in `TimeTriangleRoPEBlock`, `|w|` = real frames) and
         O[t, f] = (1/sqrt(F)) * sum_{f'} (a_r[t, f'] K_r^w[f', f] + a_i[t, f'] K_i^w[f', f])
     for t in w. Same O(T * F^2) cost and parameters as the global block, but
     short-range phrasing is not averaged against the whole chunk. Alternating
@@ -324,6 +496,8 @@ class WindowedTimeTriangleRoPEBlock(TriangleRoPEBlock):
         window_shift: int = 0,
         dropout: float = 0.0,
         residual_scale: float = 1.0,
+        soft_norm: bool = True,
+        norm_floor_init: float = 0.5,
     ):
         super().__init__(
             dim=dim,
@@ -334,6 +508,8 @@ class WindowedTimeTriangleRoPEBlock(TriangleRoPEBlock):
             rope_base=rope_base,
             dropout=dropout,
             residual_scale=residual_scale,
+            soft_norm=soft_norm,
+            norm_floor_init=norm_floor_init,
         )
         if time_window <= 0:
             raise ValueError(f"time_window must be positive, got {time_window}.")
@@ -344,9 +520,12 @@ class WindowedTimeTriangleRoPEBlock(TriangleRoPEBlock):
         self.time_window = time_window
         self.time_window_shift = window_shift
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, frame_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         batch, frames, bands, _dim = x.shape
         a, b, c, out_gate = self._project_abc(x)
+        a, b, c, valid = self._mask_abc(a, b, c, frame_mask)
 
         a_r, a_i, b_r, b_i = self.rope.apply_time(a, b)
         c_0, c_1 = c.chunk(2, dim=-1)
@@ -378,25 +557,12 @@ class WindowedTimeTriangleRoPEBlock(TriangleRoPEBlock):
         b_iw = b_i.reshape(batch, m_ch, num_win, win, bands)
         c_w = c_cat.reshape(batch, m_ch, num_win, win, two_f)
 
-        # Number of real (unpadded) frames per window, for an unbiased mean.
-        win_start = torch.arange(num_win, device=x.device) * win - shift
-        valid = (
-            torch.clamp(win_start + win, max=frames) - torch.clamp(win_start, min=0)
-        ).clamp_min(1)
-        inv_count = (1.0 / valid.to(torch.float32)).view(1, 1, num_win, 1, 1)
-        inv_count = inv_count.to(dtype=c_w.dtype)
+        # Number of real (unpadded, unmasked) frames per window, for an unbiased mean.
+        inv_count = self._window_inv_counts(valid, shift, pad_right, win)
 
-        k_r = torch.matmul(b_rw.transpose(-2, -1), c_w) * inv_count
-        k_i = torch.matmul(b_iw.transpose(-2, -1), c_w) * inv_count
-        k_rms = (
-            (k_r.float().square() + k_i.float().square())
-            .mean(dim=-2, keepdim=True)
-            .add(1e-6)
-            .sqrt()
-            .to(dtype=k_r.dtype)
-        )
-        k_r = k_r / k_rms
-        k_i = k_i / k_rms
+        k_r = torch.matmul(b_rw.transpose(-2, -1), c_w) * inv_count.to(dtype=c_w.dtype)
+        k_i = torch.matmul(b_iw.transpose(-2, -1), c_w) * inv_count.to(dtype=c_w.dtype)
+        k_r, k_i = self._normalize_kernel(k_r, k_i, inv_count)
 
         inv_sqrt_f = 1.0 / math.sqrt(bands)
         o_w = (torch.matmul(a_rw, k_r) + torch.matmul(a_iw, k_i)) * inv_sqrt_f
@@ -408,7 +574,7 @@ class WindowedTimeTriangleRoPEBlock(TriangleRoPEBlock):
 class GlobalFreqTriangleRoPEBlock(TriangleRoPEBlock):
     """Global chunk-wide real-RoPE band-to-band softmax affinity:
         M[f, f'] = Re(mean_{t'} (R_f a[t', f]) * conj(R_{f'} b[t', f']))
-        A[f, f'] = softmax_{f'}(RMSNorm_{f'}(M[f, f']) * freq_scale)
+        A[f, :]  = softmax([norm(M[f, :]) * freq_scale, sink])[:F]
         O[t, f]  = sum_{f'} A[f, f'] * c[t, f'].
     """
 
@@ -422,6 +588,9 @@ class GlobalFreqTriangleRoPEBlock(TriangleRoPEBlock):
         dropout: float = 0.0,
         residual_scale: float = 1.0,
         freq_positions: torch.Tensor | None = None,
+        soft_norm: bool = True,
+        norm_floor_init: float = 0.5,
+        attn_sink: bool = True,
     ):
         super().__init__(
             dim=dim,
@@ -435,11 +604,16 @@ class GlobalFreqTriangleRoPEBlock(TriangleRoPEBlock):
             dropout=dropout,
             residual_scale=residual_scale,
             freq_positions=freq_positions,
+            soft_norm=soft_norm,
+            norm_floor_init=norm_floor_init,
+            attn_sink=attn_sink,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _batch, frames, _bands, _dim = x.shape
+    def forward(
+        self, x: torch.Tensor, frame_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         a, b, c, out_gate = self._project_abc(x)
+        a, b, c, valid = self._mask_abc(a, b, c, frame_mask)
 
         a_r, a_i, b_r, b_i = self._apply_freq_rope(a, b)
         c_0, c_1 = c.chunk(2, dim=-1)
@@ -451,15 +625,12 @@ class GlobalFreqTriangleRoPEBlock(TriangleRoPEBlock):
         c_0 = c_0.permute(0, 3, 1, 2)
         c_1 = c_1.permute(0, 3, 1, 2)
 
-        assert self.freq_scale is not None
-        scale = self.freq_scale.float().clamp(0.1, 20.0).view(1, -1, 1, 1)
+        inv_t = self._global_inv_count(valid)
         m = (
             torch.matmul(a_r.transpose(-2, -1), b_r)
             + torch.matmul(a_i.transpose(-2, -1), b_i)
-        ) * (1.0 / frames)
-        m_f = m.float()
-        m_rms = m_f.square().mean(dim=-1, keepdim=True).add(1e-6).sqrt()
-        attn = F.softmax((m_f / m_rms) * scale, dim=-1).to(dtype=c_0.dtype)
+        ) * inv_t.to(dtype=a_r.dtype)
+        attn = self._freq_attention(m, inv_t).to(dtype=c_0.dtype)
         c_freq = torch.cat((c_0, c_1), dim=-2)
         o_freq = torch.matmul(c_freq, attn.transpose(-2, -1))
         o_0, o_1 = o_freq.chunk(2, dim=-2)
@@ -483,6 +654,9 @@ class WindowedFreqTriangleRoPEBlock(TriangleRoPEBlock):
         dropout: float = 0.0,
         residual_scale: float = 1.0,
         freq_positions: torch.Tensor | None = None,
+        soft_norm: bool = True,
+        norm_floor_init: float = 0.5,
+        attn_sink: bool = True,
     ):
         super().__init__(
             dim=dim,
@@ -496,11 +670,17 @@ class WindowedFreqTriangleRoPEBlock(TriangleRoPEBlock):
             dropout=dropout,
             residual_scale=residual_scale,
             freq_positions=freq_positions,
+            soft_norm=soft_norm,
+            norm_floor_init=norm_floor_init,
+            attn_sink=attn_sink,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, frame_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         batch, frames, bands, _dim = x.shape
         a, b, c, out_gate = self._project_abc(x)
+        a, b, c, valid = self._mask_abc(a, b, c, frame_mask)
 
         a_r, a_i, b_r, b_i = self._apply_freq_rope(a, b)
         c_0, c_1 = c.chunk(2, dim=-1)
@@ -512,8 +692,6 @@ class WindowedFreqTriangleRoPEBlock(TriangleRoPEBlock):
         c_0 = c_0.permute(0, 3, 1, 2)
         c_1 = c_1.permute(0, 3, 1, 2)
 
-        assert self.freq_scale is not None
-        scale = self.freq_scale.float().clamp(0.1, 20.0)
         win = self.freq_window
         shift = self.window_shift
         pad_right = (-(frames + shift)) % win
@@ -534,15 +712,12 @@ class WindowedFreqTriangleRoPEBlock(TriangleRoPEBlock):
         b_rw = b_r.reshape(batch, m_ch, num_win, win, bands)
         b_iw = b_i.reshape(batch, m_ch, num_win, win, bands)
 
+        inv_count = self._window_inv_counts(valid, shift, pad_right, win)
         m = (
             torch.matmul(a_rw.transpose(-2, -1), b_rw)
             + torch.matmul(a_iw.transpose(-2, -1), b_iw)
-        ) * (1.0 / win)
-        m_f = m.float()
-        m_rms = m_f.square().mean(dim=-1, keepdim=True).add(1e-6).sqrt()
-        attn = F.softmax(
-            (m_f / m_rms) * scale.view(1, -1, 1, 1, 1), dim=-1
-        ).to(dtype=c_0.dtype)
+        ) * inv_count.to(dtype=a_rw.dtype)
+        attn = self._freq_attention(m, inv_count).to(dtype=c_0.dtype)
 
         c_w = torch.cat(
             (
@@ -562,6 +737,117 @@ class WindowedFreqTriangleRoPEBlock(TriangleRoPEBlock):
         return self._finish_block(x, o_0, o_1, out_gate)
 
 
+class CausalFreqTriangleRoPEBlock(TriangleRoPEBlock):
+    """Causal band-to-band affinity pooled over an exponentially decayed prefix:
+        M_t[f, f'] = sum_{t' <= t} g^(t - t') m_{t'}[f, f'] / sum_{t' <= t} g^(t - t')
+        m_t[f, f'] = Re((R_f a[t, f]) * conj(R_{f'} b[t, f']))
+        O[t, f]    = sum_{f'} softmax_{f'}(M_t[f, :])[f'] * c[t, f'],
+    with a learnable per-channel decay `g` (half-lives initialized log-spaced over
+    `decay_half_life` frames). Frame `t` only depends on frames `<= t`, but unlike
+    a frame-local affinity (rank 2 per channel) it keeps co-modulation statistics
+    across time. Computed in chunks of `chunk_size`; memory per chunk is
+    `O(B * M * chunk_size * F^2)`, like the causal `TimeTriangleRoPEBlock`.
+    `causal_decay=False` gives the plain running mean.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        tri_dim: int | None = 128,
+        heads: int | None = None,
+        ffn_mult: float = 3.0,
+        rope_base: float = 1_000.0,
+        chunk_size: int = 32,
+        dropout: float = 0.0,
+        residual_scale: float = 1.0,
+        freq_positions: torch.Tensor | None = None,
+        soft_norm: bool = True,
+        norm_floor_init: float = 0.5,
+        attn_sink: bool = True,
+        causal_decay: bool = True,
+        decay_half_life: tuple[float, float] = (2.0, 512.0),
+    ):
+        super().__init__(
+            dim=dim,
+            tri_dim=tri_dim,
+            heads=heads,
+            axis="freq",
+            ffn_mult=ffn_mult,
+            rope_base=rope_base,
+            dropout=dropout,
+            residual_scale=residual_scale,
+            freq_positions=freq_positions,
+            soft_norm=soft_norm,
+            norm_floor_init=norm_floor_init,
+            attn_sink=attn_sink,
+        )
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+        self.chunk_size = chunk_size
+        if causal_decay:
+            self.freq_decay_logit = nn.Parameter(
+                _decay_logit_init(self.heads, *decay_half_life)
+            )
+        else:
+            self.register_parameter("freq_decay_logit", None)
+
+    def forward(
+        self, x: torch.Tensor, frame_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        batch, frames, bands, _dim = x.shape
+        a, b, c, out_gate = self._project_abc(x)
+        a, b, c, valid = self._mask_abc(a, b, c, frame_mask)
+
+        a_r, a_i, b_r, b_i = self._apply_freq_rope(a, b)
+        c_0, c_1 = c.chunk(2, dim=-1)
+
+        a_r = a_r.permute(0, 3, 1, 2)
+        a_i = a_i.permute(0, 3, 1, 2)
+        b_r = b_r.permute(0, 3, 1, 2)
+        b_i = b_i.permute(0, 3, 1, 2)
+        c_0 = c_0.permute(0, 3, 1, 2)
+        c_1 = c_1.permute(0, 3, 1, 2)
+        m_ch = a_r.shape[1]
+
+        log_gamma = (
+            None
+            if self.freq_decay_logit is None
+            else F.logsigmoid(self.freq_decay_logit.float())
+        )
+        state = torch.zeros(
+            batch, m_ch, bands, bands, device=x.device, dtype=torch.float32
+        )
+        count = torch.zeros(batch, m_ch, device=x.device, dtype=torch.float32)
+        outs_0: list[torch.Tensor] = []
+        outs_1: list[torch.Tensor] = []
+
+        for start in range(0, frames, self.chunk_size):
+            end = min(start + self.chunk_size, frames)
+            w, carry = _decay_weights(log_gamma, end - start, x.device)
+            delta = torch.einsum(
+                "bmlf,bmlg->bmlfg",
+                a_r[:, :, start:end].float(),
+                b_r[:, :, start:end].float(),
+            ) + torch.einsum(
+                "bmlf,bmlg->bmlfg",
+                a_i[:, :, start:end].float(),
+                b_i[:, :, start:end].float(),
+            )
+            cum, n = _decayed_chunk_scan(
+                delta, valid[:, start:end], w, carry, state, count
+            )
+            state = cum[:, :, -1]
+            count = n[:, :, -1]
+            inv_n = 1.0 / n.clamp_min(1e-6)[..., None, None]
+            attn = self._freq_attention(cum * inv_n, inv_n).to(dtype=c_0.dtype)
+            outs_0.append(torch.einsum("bmlfg,bmlg->bmlf", attn, c_0[:, :, start:end]))
+            outs_1.append(torch.einsum("bmlfg,bmlg->bmlf", attn, c_1[:, :, start:end]))
+
+        o_0 = outs_0[0] if len(outs_0) == 1 else torch.cat(outs_0, dim=2)
+        o_1 = outs_1[0] if len(outs_1) == 1 else torch.cat(outs_1, dim=2)
+        return self._finish_block(x, o_0, o_1, out_gate)
+
+
 def make_freq_triangle_block(
     dim: int,
     tri_dim: int | None = 128,
@@ -573,21 +859,17 @@ def make_freq_triangle_block(
     dropout: float = 0.0,
     residual_scale: float = 1.0,
     freq_positions: torch.Tensor | None = None,
+    causal: bool = False,
+    chunk_size: int = 32,
+    soft_norm: bool = True,
+    norm_floor_init: float = 0.5,
+    attn_sink: bool = True,
+    causal_decay: bool = True,
 ) -> TriangleRoPEBlock:
-    if freq_window > 0:
-        return WindowedFreqTriangleRoPEBlock(
-            dim=dim,
-            tri_dim=tri_dim,
-            heads=heads,
-            ffn_mult=ffn_mult,
-            rope_base=rope_base,
-            freq_window=freq_window,
-            window_shift=window_shift,
-            dropout=dropout,
-            residual_scale=residual_scale,
-            freq_positions=freq_positions,
-        )
-    return GlobalFreqTriangleRoPEBlock(
+    """`causal=True` builds a decayed-prefix affinity (window args ignored);
+    otherwise `freq_window > 0` builds a windowed affinity and `freq_window == 0`
+    a chunk-wide one."""
+    common = dict(
         dim=dim,
         tri_dim=tri_dim,
         heads=heads,
@@ -596,7 +878,19 @@ def make_freq_triangle_block(
         dropout=dropout,
         residual_scale=residual_scale,
         freq_positions=freq_positions,
+        soft_norm=soft_norm,
+        norm_floor_init=norm_floor_init,
+        attn_sink=attn_sink,
     )
+    if causal:
+        return CausalFreqTriangleRoPEBlock(
+            chunk_size=chunk_size, causal_decay=causal_decay, **common
+        )
+    if freq_window > 0:
+        return WindowedFreqTriangleRoPEBlock(
+            freq_window=freq_window, window_shift=window_shift, **common
+        )
+    return GlobalFreqTriangleRoPEBlock(**common)
 
 
 def make_time_triangle_block(
@@ -611,31 +905,29 @@ def make_time_triangle_block(
     window_shift: int = 0,
     dropout: float = 0.0,
     residual_scale: float = 1.0,
+    soft_norm: bool = True,
+    norm_floor_init: float = 0.5,
+    causal_decay: bool = True,
 ) -> TriangleRoPEBlock:
     """`time_window > 0` builds a local windowed (non-causal) time contraction;
     `time_window == 0` builds the chunk-wide (or causal prefix) contraction."""
-    if time_window > 0:
-        if causal:
-            raise ValueError("Windowed time contraction is non-causal; use time_window=0.")
-        return WindowedTimeTriangleRoPEBlock(
-            dim=dim,
-            tri_dim=tri_dim,
-            heads=heads,
-            ffn_mult=ffn_mult,
-            rope_base=rope_base,
-            time_window=time_window,
-            window_shift=window_shift,
-            dropout=dropout,
-            residual_scale=residual_scale,
-        )
-    return TimeTriangleRoPEBlock(
+    common = dict(
         dim=dim,
         tri_dim=tri_dim,
         heads=heads,
-        causal=causal,
-        chunk_size=chunk_size,
         ffn_mult=ffn_mult,
         rope_base=rope_base,
         dropout=dropout,
         residual_scale=residual_scale,
+        soft_norm=soft_norm,
+        norm_floor_init=norm_floor_init,
+    )
+    if time_window > 0:
+        if causal:
+            raise ValueError("Windowed time contraction is non-causal; use time_window=0.")
+        return WindowedTimeTriangleRoPEBlock(
+            time_window=time_window, window_shift=window_shift, **common
+        )
+    return TimeTriangleRoPEBlock(
+        causal=causal, chunk_size=chunk_size, causal_decay=causal_decay, **common
     )

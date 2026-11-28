@@ -17,6 +17,9 @@ class ConvNeXtV2TemporalMixer(nn.Module):
     Expects `[N, frames, dim]` (e.g., `[B * bands, frames, dim]`).
     When `causal=True`, applies left-only padding on the depthwise conv so
     frame `t` never sees frames `> t`.
+
+    `frame_mask` (`[N, frames]`, 1 = real frame) zeroes padded frames before the
+    depthwise conv and excludes them from the (non-causal) GRN statistics.
     """
 
     def __init__(
@@ -53,8 +56,15 @@ class ConvNeXtV2TemporalMixer(nn.Module):
             std=(1.0 / math.sqrt(hidden_dim)) * residual_scale,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h_in = x.transpose(1, 2)
+    def forward(
+        self, x: torch.Tensor, frame_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        valid = None
+        h_in = x
+        if frame_mask is not None:
+            valid = frame_mask.to(device=x.device, dtype=torch.float32)[:, :, None]
+            h_in = x * valid.to(dtype=x.dtype)
+        h_in = h_in.transpose(1, 2)
         if self.causal:
             h_in = F.pad(h_in, (self.kernel_size - 1, 0))
         h = self.dwconv(h_in).transpose(1, 2)
@@ -64,8 +74,13 @@ class ConvNeXtV2TemporalMixer(nn.Module):
         if self.causal:
             # Causal per-frame RMS over channels (avoids future leakage across time)
             gx = h.float().square().add(1e-6).sqrt()
-        else:
+        elif valid is None:
             gx = h.float().square().mean(dim=1, keepdim=True).add(1e-6).sqrt()
+        else:
+            count = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+            gx = (
+                (h.float().square() * valid).sum(dim=1, keepdim=True) / count
+            ).add(1e-6).sqrt()
         nx = (gx / (gx.mean(dim=-1, keepdim=True) + 1e-6)).to(dtype=h.dtype)
         h = h + self.grn_gamma.to(dtype=h.dtype) * (h * nx) + self.grn_beta.to(
             dtype=h.dtype
@@ -90,6 +105,11 @@ class FineRateBoundaryBlock(nn.Module):
         dropout: float = 0.0,
         residual_scale: float = 1.0,
         freq_positions: torch.Tensor | None = None,
+        chunk_size: int = 32,
+        soft_norm: bool = True,
+        norm_floor_init: float = 0.5,
+        attn_sink: bool = True,
+        causal_decay: bool = True,
     ):
         super().__init__()
         self.temporal_mixer = ConvNeXtV2TemporalMixer(
@@ -105,10 +125,14 @@ class FineRateBoundaryBlock(nn.Module):
             tri_dim=tri_dim,
             heads=heads,
             causal=causal,
+            chunk_size=chunk_size,
             ffn_mult=ffn_mult,
             rope_base=10_000.0,
             dropout=dropout,
             residual_scale=residual_scale,
+            soft_norm=soft_norm,
+            norm_floor_init=norm_floor_init,
+            causal_decay=causal_decay,
         )
         self.freq_layer = make_freq_triangle_block(
             dim=dim,
@@ -121,6 +145,12 @@ class FineRateBoundaryBlock(nn.Module):
             dropout=dropout,
             residual_scale=residual_scale,
             freq_positions=freq_positions,
+            causal=causal,
+            chunk_size=chunk_size,
+            soft_norm=soft_norm,
+            norm_floor_init=norm_floor_init,
+            attn_sink=attn_sink,
+            causal_decay=causal_decay,
         )
 
     def compile_layers(self, mode: str = "default") -> None:
@@ -133,10 +163,11 @@ class FineRateBoundaryBlock(nn.Module):
         module: nn.Module,
         x: torch.Tensor,
         use_checkpoint: bool,
+        frame_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not use_checkpoint:
-            return module(x)
-        return checkpoint(module, x, use_reentrant=False)
+            return module(x, frame_mask)
+        return checkpoint(module, x, frame_mask, use_reentrant=False)
 
     def forward(
         self,
@@ -144,23 +175,31 @@ class FineRateBoundaryBlock(nn.Module):
         should_checkpoint: bool = False,
         keep_t: torch.Tensor | float | None = None,
         keep_f: torch.Tensor | float | None = None,
+        frame_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, frames, bands, dim = x.shape
         t_in = x.permute(0, 2, 1, 3).reshape(batch * bands, frames, dim)
+        t_mask = (
+            None
+            if frame_mask is None
+            else frame_mask.repeat_interleave(bands, dim=0)
+        )
         t_mixed = self._run_unit(
-            self.temporal_mixer, t_in, should_checkpoint
+            self.temporal_mixer, t_in, should_checkpoint, t_mask
         )
         x_mixed = t_mixed.reshape(batch, bands, frames, dim).permute(0, 2, 1, 3)
 
         if keep_t is not None and isinstance(keep_t, float) and keep_t == 0.0:
             x = x_mixed
         else:
-            t_out = self._run_unit(self.time_layer, x_mixed, should_checkpoint)
+            t_out = self._run_unit(
+                self.time_layer, x_mixed, should_checkpoint, frame_mask
+            )
             x = t_out if keep_t is None else x_mixed + (t_out - x_mixed) * keep_t
 
         if keep_f is not None and isinstance(keep_f, float) and keep_f == 0.0:
             return x
-        f_out = self._run_unit(self.freq_layer, x, should_checkpoint)
+        f_out = self._run_unit(self.freq_layer, x, should_checkpoint, frame_mask)
         return f_out if keep_f is None else x + (f_out - x) * keep_f
 
 
