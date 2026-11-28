@@ -1,7 +1,32 @@
 from __future__ import annotations
 
+import math
+from typing import Sequence
+
 import torch
 import torch.nn as nn
+
+
+def log_frequency_positions(
+    band_freqs_hz: Sequence[float],
+    min_hz: float = 20.0,
+) -> torch.Tensor:
+    """Map band center frequencies (Hz) to RoPE positions in semitone units.
+
+    `pos[f] = 12 * log2(max(hz[f], min_hz) / min_hz)`, so any fixed frequency
+    *ratio* (octave = 12, fifth ~ 7.02, ...) is a fixed positional offset,
+    independent of absolute pitch. Relative-RoPE contractions over these
+    positions therefore see harmonic intervals identically for every F0.
+    """
+    if len(band_freqs_hz) == 0:
+        raise ValueError("band_freqs_hz must contain at least one band.")
+    if min_hz <= 0.0:
+        raise ValueError(f"min_hz must be positive, got {min_hz}.")
+    values = [float(hz) for hz in band_freqs_hz]
+    if any(not math.isfinite(hz) or hz < 0.0 for hz in values):
+        raise ValueError("band_freqs_hz must be finite and non-negative.")
+    hz = torch.tensor(values, dtype=torch.float64).clamp_min(min_hz)
+    return (12.0 * torch.log2(hz / min_hz)).to(torch.float32)
 
 
 class RotaryEmbedding(nn.Module):
@@ -13,6 +38,8 @@ class RotaryEmbedding(nn.Module):
     - `"freq"`: frequency axis of 2D `[B, T, F, tri_dim]` (dim 2)
 
     Supports an optional `offset` for incremental autoregressive decoding.
+    The frequency axis can instead use explicit per-band tables built by
+    `freq_tables` (see `TriangleRoPEBlock`).
     """
 
     def __init__(self, dim: int, base: float = 10_000.0):
@@ -58,6 +85,48 @@ class RotaryEmbedding(nn.Module):
             self._sin_cached = sin
             self._cached_len = total_len
         return cos[offset:total_len], sin[offset:total_len]
+
+    def freq_tables(self, log_positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build `[F, dim // 2]` cos/sin tables for the frequency axis.
+
+        Rotary channel pairs are interleaved between two position systems so both
+        cover the full range of rotation frequencies:
+          - even pairs: log-frequency positions (semitones; pitch-invariant
+            harmonic ratios),
+          - odd pairs: band index (linear spacing; harmonic comb periodicity).
+        """
+        if log_positions.ndim != 1:
+            raise ValueError(
+                f"log_positions must be 1D [F], got shape {tuple(log_positions.shape)}."
+            )
+        bands = log_positions.shape[0]
+        log_pos = log_positions.to(dtype=torch.float32, device=self.inv_freq.device)
+        index_pos = torch.arange(bands, dtype=torch.float32, device=log_pos.device)
+        pair_is_log = (
+            torch.arange(self.dim // 2, device=log_pos.device) % 2 == 0
+        )
+        positions = torch.where(
+            pair_is_log[None, :], log_pos[:, None], index_pos[:, None]
+        )
+        angles = positions * self.inv_freq.to(dtype=torch.float32)[None, :]
+        return angles.cos(), angles.sin()
+
+    def apply_freq_tables(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply precomputed `[F, dim // 2]` tables along dim 2 of `[B, T, F, dim]`."""
+        if cos.shape[0] != a.shape[2]:
+            raise ValueError(
+                f"Frequency RoPE tables cover {cos.shape[0]} bands but input has "
+                f"{a.shape[2]} bands."
+            )
+        cos = cos.to(dtype=a.dtype)[None, None, :, :]
+        sin = sin.to(dtype=a.dtype)[None, None, :, :]
+        return self._rotate_pair(a, b, cos, sin)
 
     @staticmethod
     def _rotate_pair(

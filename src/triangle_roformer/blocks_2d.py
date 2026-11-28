@@ -34,10 +34,16 @@ class TriangleRoPEBlock(nn.Module):
     """Base Bipartite 2D Time-Frequency Triangle Multiplicative Update with
     Real-Valued Relative-RoPE Contractions for `[B, T, F, D]` grids.
 
-    Subclasses (`TimeTriangleRoPEBlock`, `GlobalFreqTriangleRoPEBlock`,
-    `WindowedFreqTriangleRoPEBlock`) each define a branch-free forward method so
-    `torch.compile` keeps separate Dynamo caches per contraction type without
-    hitting `recompile_limit` under activation checkpointing.
+    Subclasses (`TimeTriangleRoPEBlock`, `WindowedTimeTriangleRoPEBlock`,
+    `GlobalFreqTriangleRoPEBlock`, `WindowedFreqTriangleRoPEBlock`) each define a
+    branch-free forward method so `torch.compile` keeps separate Dynamo caches per
+    contraction type without hitting `recompile_limit` under activation
+    checkpointing.
+
+    Frequency-axis blocks require `freq_positions`: per-band log-frequency
+    positions (semitones, see `rope.log_frequency_positions`). Half of the rotary
+    pairs rotate by log-frequency (pitch-invariant harmonic ratios) and half by
+    band index (linear harmonic-comb spacing).
     """
 
     def __init__(
@@ -52,6 +58,7 @@ class TriangleRoPEBlock(nn.Module):
         window_shift: int = 0,
         dropout: float = 0.0,
         residual_scale: float = 1.0,
+        freq_positions: torch.Tensor | None = None,
     ):
         super().__init__()
         resolved_tri_dim = _resolve_tri_dim(dim, tri_dim, heads)
@@ -83,9 +90,19 @@ class TriangleRoPEBlock(nn.Module):
         self.c_norm = nn.RMSNorm(resolved_tri_dim)
         self.rope = RotaryEmbedding(resolved_tri_dim, base=rope_base)
         if axis == "freq":
+            if freq_positions is None:
+                raise ValueError(
+                    "Frequency-axis Triangle-RoPE blocks require freq_positions "
+                    "(per-band log-frequency positions)."
+                )
+            freq_cos, freq_sin = self.rope.freq_tables(torch.as_tensor(freq_positions))
+            self.register_buffer("freq_cos", freq_cos, persistent=False)
+            self.register_buffer("freq_sin", freq_sin, persistent=False)
             # 1D parameter (no weight decay) controlling softmax sharpness per channel
             self.freq_scale = nn.Parameter(torch.full((resolved_tri_dim // 2,), 2.0))
         else:
+            self.register_buffer("freq_cos", None, persistent=False)
+            self.register_buffer("freq_sin", None, persistent=False)
             self.register_parameter("freq_scale", None)
         self.tri_out_norm = nn.RMSNorm(resolved_tri_dim)
         self.tri_out = nn.Linear(resolved_tri_dim, dim, bias=False)
@@ -121,6 +138,12 @@ class TriangleRoPEBlock(nn.Module):
         b = self.b_norm(b_val) * torch.tanh(b_gate)
         c = self.c_norm(c_val) * torch.sigmoid(c_gate)
         return a, b, c, out_gate
+
+    def _apply_freq_rope(
+        self, a: torch.Tensor, b: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert self.freq_cos is not None and self.freq_sin is not None
+        return self.rope.apply_freq_tables(a, b, self.freq_cos, self.freq_sin)
 
     def _finish_block(
         self,
@@ -276,6 +299,112 @@ class TimeTriangleRoPEBlock(TriangleRoPEBlock):
         return self._finish_block(x, o_0, o_1, out_gate)
 
 
+class WindowedTimeTriangleRoPEBlock(TriangleRoPEBlock):
+    """Local (optionally half-shifted) windowed time-to-time real-RoPE contraction.
+
+    Frames are tiled into non-overlapping windows of `time_window` frames (after a
+    left pad of `window_shift`). Each window w gets its own transfer matrix
+        K_r^w[f', f] = (1/|w|) * sum_{t' in w} b_r[t', f'] * c[t', f]
+        K_i^w[f', f] = (1/|w|) * sum_{t' in w} b_i[t', f'] * c[t', f]
+    (joint RMS-normalized as in `TimeTriangleRoPEBlock`) and
+        O[t, f] = (1/sqrt(F)) * sum_{f'} (a_r[t, f'] K_r^w[f', f] + a_i[t, f'] K_i^w[f', f])
+    for t in w. Same O(T * F^2) cost and parameters as the global block, but
+    short-range phrasing is not averaged against the whole chunk. Alternating
+    the shift across layers moves window seams.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        tri_dim: int | None = 128,
+        heads: int | None = None,
+        ffn_mult: float = 3.0,
+        rope_base: float = 10_000.0,
+        time_window: int = 64,
+        window_shift: int = 0,
+        dropout: float = 0.0,
+        residual_scale: float = 1.0,
+    ):
+        super().__init__(
+            dim=dim,
+            tri_dim=tri_dim,
+            heads=heads,
+            axis="time",
+            ffn_mult=ffn_mult,
+            rope_base=rope_base,
+            dropout=dropout,
+            residual_scale=residual_scale,
+        )
+        if time_window <= 0:
+            raise ValueError(f"time_window must be positive, got {time_window}.")
+        if not 0 <= window_shift < time_window:
+            raise ValueError(
+                f"window_shift ({window_shift}) must be in [0, time_window)."
+            )
+        self.time_window = time_window
+        self.time_window_shift = window_shift
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, frames, bands, _dim = x.shape
+        a, b, c, out_gate = self._project_abc(x)
+
+        a_r, a_i, b_r, b_i = self.rope.apply_time(a, b)
+        c_0, c_1 = c.chunk(2, dim=-1)
+
+        a_r = a_r.permute(0, 3, 1, 2)
+        a_i = a_i.permute(0, 3, 1, 2)
+        b_r = b_r.permute(0, 3, 1, 2)
+        b_i = b_i.permute(0, 3, 1, 2)
+        c_cat = torch.cat((c_0.permute(0, 3, 1, 2), c_1.permute(0, 3, 1, 2)), dim=-1)
+
+        win = self.time_window
+        shift = self.time_window_shift
+        pad_right = (-(frames + shift)) % win
+        pad_spec = (0, 0, shift, pad_right)
+        a_r = F.pad(a_r, pad_spec)
+        a_i = F.pad(a_i, pad_spec)
+        b_r = F.pad(b_r, pad_spec)
+        b_i = F.pad(b_i, pad_spec)
+        c_cat = F.pad(c_cat, pad_spec)
+
+        padded_t = a_r.shape[2]
+        num_win = padded_t // win
+        m_ch = a_r.shape[1]
+        two_f = c_cat.shape[-1]
+
+        a_rw = a_r.reshape(batch, m_ch, num_win, win, bands)
+        a_iw = a_i.reshape(batch, m_ch, num_win, win, bands)
+        b_rw = b_r.reshape(batch, m_ch, num_win, win, bands)
+        b_iw = b_i.reshape(batch, m_ch, num_win, win, bands)
+        c_w = c_cat.reshape(batch, m_ch, num_win, win, two_f)
+
+        # Number of real (unpadded) frames per window, for an unbiased mean.
+        win_start = torch.arange(num_win, device=x.device) * win - shift
+        valid = (
+            torch.clamp(win_start + win, max=frames) - torch.clamp(win_start, min=0)
+        ).clamp_min(1)
+        inv_count = (1.0 / valid.to(torch.float32)).view(1, 1, num_win, 1, 1)
+        inv_count = inv_count.to(dtype=c_w.dtype)
+
+        k_r = torch.matmul(b_rw.transpose(-2, -1), c_w) * inv_count
+        k_i = torch.matmul(b_iw.transpose(-2, -1), c_w) * inv_count
+        k_rms = (
+            (k_r.float().square() + k_i.float().square())
+            .mean(dim=-2, keepdim=True)
+            .add(1e-6)
+            .sqrt()
+            .to(dtype=k_r.dtype)
+        )
+        k_r = k_r / k_rms
+        k_i = k_i / k_rms
+
+        inv_sqrt_f = 1.0 / math.sqrt(bands)
+        o_w = (torch.matmul(a_rw, k_r) + torch.matmul(a_iw, k_i)) * inv_sqrt_f
+        o_cat = o_w.reshape(batch, m_ch, padded_t, two_f)[:, :, shift : shift + frames, :]
+        o_0, o_1 = o_cat.chunk(2, dim=-1)
+        return self._finish_block(x, o_0, o_1, out_gate)
+
+
 class GlobalFreqTriangleRoPEBlock(TriangleRoPEBlock):
     """Global chunk-wide real-RoPE band-to-band softmax affinity:
         M[f, f'] = Re(mean_{t'} (R_f a[t', f]) * conj(R_{f'} b[t', f']))
@@ -292,6 +421,7 @@ class GlobalFreqTriangleRoPEBlock(TriangleRoPEBlock):
         rope_base: float = 1_000.0,
         dropout: float = 0.0,
         residual_scale: float = 1.0,
+        freq_positions: torch.Tensor | None = None,
     ):
         super().__init__(
             dim=dim,
@@ -304,13 +434,14 @@ class GlobalFreqTriangleRoPEBlock(TriangleRoPEBlock):
             window_shift=0,
             dropout=dropout,
             residual_scale=residual_scale,
+            freq_positions=freq_positions,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _batch, frames, _bands, _dim = x.shape
         a, b, c, out_gate = self._project_abc(x)
 
-        a_r, a_i, b_r, b_i = self.rope.apply_freq(a, b)
+        a_r, a_i, b_r, b_i = self._apply_freq_rope(a, b)
         c_0, c_1 = c.chunk(2, dim=-1)
 
         a_r = a_r.permute(0, 3, 1, 2)
@@ -351,6 +482,7 @@ class WindowedFreqTriangleRoPEBlock(TriangleRoPEBlock):
         window_shift: int = 0,
         dropout: float = 0.0,
         residual_scale: float = 1.0,
+        freq_positions: torch.Tensor | None = None,
     ):
         super().__init__(
             dim=dim,
@@ -363,13 +495,14 @@ class WindowedFreqTriangleRoPEBlock(TriangleRoPEBlock):
             window_shift=window_shift,
             dropout=dropout,
             residual_scale=residual_scale,
+            freq_positions=freq_positions,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, frames, bands, _dim = x.shape
         a, b, c, out_gate = self._project_abc(x)
 
-        a_r, a_i, b_r, b_i = self.rope.apply_freq(a, b)
+        a_r, a_i, b_r, b_i = self._apply_freq_rope(a, b)
         c_0, c_1 = c.chunk(2, dim=-1)
 
         a_r = a_r.permute(0, 3, 1, 2)
@@ -439,6 +572,7 @@ def make_freq_triangle_block(
     window_shift: int = 0,
     dropout: float = 0.0,
     residual_scale: float = 1.0,
+    freq_positions: torch.Tensor | None = None,
 ) -> TriangleRoPEBlock:
     if freq_window > 0:
         return WindowedFreqTriangleRoPEBlock(
@@ -451,11 +585,55 @@ def make_freq_triangle_block(
             window_shift=window_shift,
             dropout=dropout,
             residual_scale=residual_scale,
+            freq_positions=freq_positions,
         )
     return GlobalFreqTriangleRoPEBlock(
         dim=dim,
         tri_dim=tri_dim,
         heads=heads,
+        ffn_mult=ffn_mult,
+        rope_base=rope_base,
+        dropout=dropout,
+        residual_scale=residual_scale,
+        freq_positions=freq_positions,
+    )
+
+
+def make_time_triangle_block(
+    dim: int,
+    tri_dim: int | None = 128,
+    heads: int | None = None,
+    causal: bool = False,
+    chunk_size: int = 32,
+    ffn_mult: float = 3.0,
+    rope_base: float = 10_000.0,
+    time_window: int = 0,
+    window_shift: int = 0,
+    dropout: float = 0.0,
+    residual_scale: float = 1.0,
+) -> TriangleRoPEBlock:
+    """`time_window > 0` builds a local windowed (non-causal) time contraction;
+    `time_window == 0` builds the chunk-wide (or causal prefix) contraction."""
+    if time_window > 0:
+        if causal:
+            raise ValueError("Windowed time contraction is non-causal; use time_window=0.")
+        return WindowedTimeTriangleRoPEBlock(
+            dim=dim,
+            tri_dim=tri_dim,
+            heads=heads,
+            ffn_mult=ffn_mult,
+            rope_base=rope_base,
+            time_window=time_window,
+            window_shift=window_shift,
+            dropout=dropout,
+            residual_scale=residual_scale,
+        )
+    return TimeTriangleRoPEBlock(
+        dim=dim,
+        tri_dim=tri_dim,
+        heads=heads,
+        causal=causal,
+        chunk_size=chunk_size,
         ffn_mult=ffn_mult,
         rope_base=rope_base,
         dropout=dropout,

@@ -71,12 +71,18 @@ logits = lm(input_ids)  # [2, 128, 32000]
 import torch
 from triangle_roformer import TriangleRoFormer2D
 
+# Center frequency (Hz) of each of the F band tokens, low to high.
+band_freqs_hz = [...]  # len == 124 here
+
 encoder = TriangleRoFormer2D(
+    band_freqs_hz,
     dim=256,
     depth=14,
     tri_dim=128,          # or heads=64 (in 2D blocks, heads = tri_dim // 2)
     causal=False,         # False for offline separation, True for causal time axis
-    freq_window=32,
+    freq_window=32,       # long local pooling window for freq affinities (frames)
+    short_freq_window=8,  # short local pooling window for freq affinities (frames)
+    time_window=64,       # local window for windowed time contractions (frames)
     ffn_mult=3.0,
     dropout=0.0,
     drop_path=0.08,
@@ -87,6 +93,26 @@ encoder = TriangleRoFormer2D(
 tokens = torch.randn(1, 64, 124, 256)  # [B, T, F, D]
 out = encoder(tokens)                  # [1, 64, 124, 256]
 ```
+
+#### Multi-scale layer schedule
+
+Every axial layer pairs one local and one chunk-wide contraction:
+
+| layer `l` | time block `T_l` | freq block `B_l` |
+|---|---|---|
+| even | chunk-wide time contraction | windowed affinity, alternating `short_freq_window` / `freq_window` |
+| odd  | windowed time contraction over `time_window` frames | chunk-wide affinity |
+
+Windowed layers alternate a half-window shift so window seams move between layers.
+In causal mode, time blocks use the exact full-prefix contraction and freq blocks use
+frame-local affinity.
+
+#### Log-frequency RoPE
+
+Frequency-axis blocks rotate half of their RoPE pairs by **log-frequency positions**
+(`12 * log2(hz / 20)`, semitones), so a harmonic ratio such as an octave is the same
+relative offset for every fundamental, and the other half by band index (linear
+harmonic-comb spacing). This is why `TriangleRoFormer2D` requires `band_freqs_hz`.
 
 ## Running Tests
 

@@ -89,6 +89,7 @@ class FineRateBoundaryBlock(nn.Module):
         freq_window_shift: int = 0,
         dropout: float = 0.0,
         residual_scale: float = 1.0,
+        freq_positions: torch.Tensor | None = None,
     ):
         super().__init__()
         self.temporal_mixer = ConvNeXtV2TemporalMixer(
@@ -119,6 +120,7 @@ class FineRateBoundaryBlock(nn.Module):
             window_shift=freq_window_shift,
             dropout=dropout,
             residual_scale=residual_scale,
+            freq_positions=freq_positions,
         )
 
     def compile_layers(self, mode: str = "default") -> None:

@@ -9,8 +9,9 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from .blocks_1d import TriangleRoFormerBlock1D, TriangleRoFormerState
-from .blocks_2d import TimeTriangleRoPEBlock, make_freq_triangle_block
+from .blocks_2d import make_freq_triangle_block, make_time_triangle_block
 from .layers import FineRateBoundaryBlock, GEGLUFusion
+from .rope import log_frequency_positions
 
 
 def _configure_dynamo_cache() -> None:
@@ -276,20 +277,36 @@ class TriangleRoFormer2D(nn.Module):
       3. `GEGLUFusion` combining deep context `Y'` and fine-rate skip `X'`.
       4. Fine-rate PostBlock + terminal `RMSNorm`.
 
+    Multi-scale layer schedule (non-causal), for layer index `l`:
+      - Time `T_l`: odd `l` use a local windowed contraction over `time_window`
+        frames (half-shift on every other windowed layer); even `l` contract over
+        the whole chunk. Each layer pairs one local and one global axis.
+      - Freq `B_l`: even `l` pool their band-to-band affinity over local windows,
+        alternating `short_freq_window` and `freq_window` frames (half-shift on
+        every other pair); odd `l` pool over the whole chunk.
+
+    `band_freqs_hz` gives each band's center frequency. Frequency-axis RoPE uses
+    log-frequency (semitone) positions on half of its rotary pairs so harmonic
+    ratios are fixed offsets regardless of pitch, and band index on the other half.
+
     When `causal=True`:
-      - All time-axis blocks run causally (frame `t` only depends on frames `<= t`).
+      - All time-axis blocks run causally over the full prefix (frame `t` only
+        depends on frames `<= t`).
       - Frequency-axis blocks use frame-local affinity (`freq_window=1, window_shift=0`)
         so no future frames leak through cross-time frequency pooling.
     """
 
     def __init__(
         self,
+        band_freqs_hz: Sequence[float],
         dim: int = 256,
         depth: int = 14,
         tri_dim: int | None = None,
         heads: int | None = None,
         causal: bool = False,
         freq_window: int = 32,
+        short_freq_window: int = 8,
+        time_window: int = 64,
         ffn_mult: float = 3.0,
         dropout: float = 0.0,
         drop_path: float = 0.08,
@@ -302,11 +319,18 @@ class TriangleRoFormer2D(nn.Module):
         super().__init__()
         if dim <= 0 or depth <= 0:
             raise ValueError(f"dim and depth must be positive, got dim={dim}, depth={depth}.")
-        if freq_window < 0:
-            raise ValueError(f"freq_window must be non-negative, got {freq_window}.")
+        for name, value in (
+            ("freq_window", freq_window),
+            ("short_freq_window", short_freq_window),
+            ("time_window", time_window),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}.")
         if not 0.0 <= drop_path < 1.0:
             raise ValueError(f"drop_path must be in [0, 1), got {drop_path}.")
 
+        freq_positions = log_frequency_positions(band_freqs_hz)
+        self.num_bands = int(freq_positions.shape[0])
         self.dim = dim
         self.depth = depth
         self.causal = causal
@@ -330,10 +354,19 @@ class TriangleRoFormer2D(nn.Module):
                 freq_window_shift=0,
                 dropout=dropout,
                 residual_scale=res_scale,
+                freq_positions=freq_positions,
             )
         else:
             self.pre_block = None
 
+        freq_schedule = [
+            self._freq_window_for_layer(idx, causal, freq_window, short_freq_window)
+            for idx in range(depth)
+        ]
+        time_schedule = [
+            self._time_window_for_layer(idx, causal, time_window)
+            for idx in range(depth)
+        ]
         self.freq_layers = nn.ModuleList(
             make_freq_triangle_block(
                 dim=dim,
@@ -341,27 +374,16 @@ class TriangleRoFormer2D(nn.Module):
                 heads=heads,
                 ffn_mult=ffn_mult,
                 rope_base=freq_rope_base,
-                freq_window=(
-                    1
-                    if causal
-                    else (freq_window if (idx % 2 == 0) else 0)
-                ),
-                window_shift=(
-                    0
-                    if causal
-                    else (
-                        half_shift
-                        if (idx % 2 == 0 and (idx // 2) % 2 == 1)
-                        else 0
-                    )
-                ),
+                freq_window=f_win,
+                window_shift=f_shift,
                 dropout=dropout,
                 residual_scale=res_scale,
+                freq_positions=freq_positions,
             )
-            for idx in range(depth)
+            for f_win, f_shift in freq_schedule
         )
         self.time_layers = nn.ModuleList(
-            TimeTriangleRoPEBlock(
+            make_time_triangle_block(
                 dim=dim,
                 tri_dim=tri_dim,
                 heads=heads,
@@ -369,10 +391,12 @@ class TriangleRoFormer2D(nn.Module):
                 chunk_size=chunk_size,
                 ffn_mult=ffn_mult,
                 rope_base=time_rope_base,
+                time_window=t_win,
+                window_shift=t_shift,
                 dropout=dropout,
                 residual_scale=res_scale,
             )
-            for _ in range(depth)
+            for t_win, t_shift in time_schedule
         )
 
         if use_boundary_blocks:
@@ -392,12 +416,36 @@ class TriangleRoFormer2D(nn.Module):
                 freq_window_shift=half_shift,
                 dropout=dropout,
                 residual_scale=res_scale,
+                freq_positions=freq_positions,
             )
         else:
             self.geglu_fusion = None
             self.post_block = None
 
         self.output_norm = nn.RMSNorm(dim)
+
+    @staticmethod
+    def _freq_window_for_layer(
+        idx: int, causal: bool, long_window: int, short_window: int
+    ) -> tuple[int, int]:
+        """(window, shift) for frequency layer `idx`; window 0 = chunk-wide."""
+        if causal:
+            return 1, 0
+        if idx % 2 == 1:
+            return 0, 0
+        window = short_window if (idx // 2) % 2 == 0 else long_window
+        shift = window // 2 if (idx // 4) % 2 == 1 else 0
+        return window, shift
+
+    @staticmethod
+    def _time_window_for_layer(
+        idx: int, causal: bool, time_window: int
+    ) -> tuple[int, int]:
+        """(window, shift) for time layer `idx`; window 0 = chunk-wide."""
+        if causal or idx % 2 == 0:
+            return 0, 0
+        shift = time_window // 2 if (idx // 2) % 2 == 1 else 0
+        return time_window, shift
 
     def compile_layers(self, mode: str = "default") -> None:
         _configure_dynamo_cache()
@@ -444,6 +492,11 @@ class TriangleRoFormer2D(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 4:
             raise ValueError(f"Expected 4D input [B, T, F, D], got {tuple(x.shape)}.")
+        if x.shape[2] != self.num_bands:
+            raise ValueError(
+                f"Model was built for {self.num_bands} bands (len(band_freqs_hz)) "
+                f"but input has {x.shape[2]}."
+            )
         batch = x.shape[0]
         if torch.is_autocast_enabled(x.device.type):
             x = x.to(torch.get_autocast_dtype(x.device.type))
