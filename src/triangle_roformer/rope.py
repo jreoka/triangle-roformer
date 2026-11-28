@@ -15,8 +15,8 @@ def log_frequency_positions(
 
     `pos[f] = 12 * log2(max(hz[f], min_hz) / min_hz)`, so any fixed frequency
     *ratio* (octave = 12, fifth ~ 7.02, ...) is a fixed positional offset,
-    independent of absolute pitch. Relative-RoPE contractions over these
-    positions therefore see harmonic intervals identically for every F0.
+    independent of absolute pitch. Relative-RoPE contractions and attention
+    over these positions therefore see harmonic intervals identically for every F0.
     """
     if len(band_freqs_hz) == 0:
         raise ValueError("band_freqs_hz must contain at least one band.")
@@ -30,16 +30,15 @@ def log_frequency_positions(
 
 
 class RotaryEmbedding(nn.Module):
-    """Complex Rotary Position Embedding (RoPE) supporting 1D sequences and 2D grids.
+    """Complex Rotary Position Embedding (RoPE) for 2D time-frequency grids.
 
-    Rotates paired real/imaginary halves of `(a, b)` along the requested axis:
-    - `"1d"`: sequence axis of `[B, H, T, head_dim]` (dim 2) or `[B, T, dim]` (dim 1)
-    - `"time"`: time axis of 2D `[B, T, F, tri_dim]` (dim 1)
-    - `"freq"`: frequency axis of 2D `[B, T, F, tri_dim]` (dim 2)
-
-    Supports an optional `offset` for incremental autoregressive decoding.
-    The frequency axis can instead use explicit per-band tables built by
-    `freq_tables` (see `TriangleRoPEBlock`).
+    Supports both:
+      - Triangle-RoPE contractions returning split real/imaginary halves
+        `(a_r, a_i, b_r, b_i)` along `"time"` (dim 1) or `"freq"` (dim 2)
+        of `[B, T, F, tri_dim]`.
+      - Standard multi-head RoPE attention returning rotated `(q, k)` for
+        `[N, H, L, head_dim]` along time (`apply_qk`) or frequency
+        (`apply_qk_tables` using interleaved log-frequency + band-index tables).
     """
 
     def __init__(self, dim: int, base: float = 10_000.0):
@@ -111,23 +110,6 @@ class RotaryEmbedding(nn.Module):
         angles = positions * self.inv_freq.to(dtype=torch.float32)[None, :]
         return angles.cos(), angles.sin()
 
-    def apply_freq_tables(
-        self,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Apply precomputed `[F, dim // 2]` tables along dim 2 of `[B, T, F, dim]`."""
-        if cos.shape[0] != a.shape[2]:
-            raise ValueError(
-                f"Frequency RoPE tables cover {cos.shape[0]} bands but input has "
-                f"{a.shape[2]} bands."
-            )
-        cos = cos.to(dtype=a.dtype)[None, None, :, :]
-        sin = sin.to(dtype=a.dtype)[None, None, :, :]
-        return self._rotate_pair(a, b, cos, sin)
-
     @staticmethod
     def _rotate_pair(
         a: torch.Tensor,
@@ -144,25 +126,21 @@ class RotaryEmbedding(nn.Module):
             b_i * cos + b_r * sin,
         )
 
-    def apply_1d(
+    def apply_freq_tables(
         self,
         a: torch.Tensor,
         b: torch.Tensor,
-        offset: int = 0,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Apply 1D RoPE to `[B, H, T, head_dim]` or `[B, T, dim]` tensors."""
-        if a.ndim == 4:
-            cos, sin = self._get_cos_sin(a.shape[2], a.device, a.dtype, offset=offset)
-            cos = cos[None, None, :, :]
-            sin = sin[None, None, :, :]
-        elif a.ndim == 3:
-            cos, sin = self._get_cos_sin(a.shape[1], a.device, a.dtype, offset=offset)
-            cos = cos[None, :, :]
-            sin = sin[None, :, :]
-        else:
+        """Apply precomputed `[F, dim // 2]` tables along dim 2 of `[B, T, F, dim]`."""
+        if cos.shape[0] != a.shape[2]:
             raise ValueError(
-                f"apply_1d expects 3D [B, T, D] or 4D [B, H, T, D] tensors, got {a.ndim}D."
+                f"Frequency RoPE tables cover {cos.shape[0]} bands but input has "
+                f"{a.shape[2]} bands."
             )
+        cos = cos.to(dtype=a.dtype)[None, None, :, :]
+        sin = sin.to(dtype=a.dtype)[None, None, :, :]
         return self._rotate_pair(a, b, cos, sin)
 
     def apply_time(
@@ -189,17 +167,46 @@ class RotaryEmbedding(nn.Module):
         sin = sin[None, None, :, :]
         return self._rotate_pair(a, b, cos, sin)
 
+    def apply_qk(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        offset: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply RoPE along dim 2 (sequence) of `[N, H, L, head_dim]` Q/K tensors."""
+        cos, sin = self._get_cos_sin(q.shape[2], q.device, q.dtype, offset=offset)
+        q_r, q_i, k_r, k_i = self._rotate_pair(
+            q, k, cos[None, None, :, :], sin[None, None, :, :]
+        )
+        return torch.cat((q_r, q_i), dim=-1), torch.cat((k_r, k_i), dim=-1)
+
+    def apply_qk_tables(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply precomputed `[F, head_dim // 2]` tables along dim 2 of `[N, H, F, head_dim]`."""
+        if cos.shape[0] != q.shape[2]:
+            raise ValueError(
+                f"Frequency RoPE tables cover {cos.shape[0]} bands but input has "
+                f"{q.shape[2]} bands."
+            )
+        cos = cos.to(dtype=q.dtype)[None, None, :, :]
+        sin = sin.to(dtype=q.dtype)[None, None, :, :]
+        q_r, q_i, k_r, k_i = self._rotate_pair(q, k, cos, sin)
+        return torch.cat((q_r, q_i), dim=-1), torch.cat((k_r, k_i), dim=-1)
+
     def forward(
         self,
         a: torch.Tensor,
         b: torch.Tensor,
-        axis: str = "1d",
+        axis: str = "time",
         offset: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if axis == "1d":
-            return self.apply_1d(a, b, offset=offset)
         if axis == "time":
             return self.apply_time(a, b, offset=offset)
         if axis == "freq":
             return self.apply_freq(a, b, offset=offset)
-        raise ValueError(f"axis must be '1d', 'time', or 'freq', got {axis!r}.")
+        raise ValueError(f"axis must be 'time' or 'freq', got {axis!r}.")

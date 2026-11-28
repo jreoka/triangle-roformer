@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "triangle-roformer"
-version = "0.3.1"
-description = "Triangle RoFormer: Linear-complexity Triangle Multiplicative Update Transformer with Relative RoPE for 1D sequences (language, audio) and 2D time-frequency grids."
+version = "0.4.0"
+description = "Triangle RoFormer 2D: Hybrid Triangle Multiplicative + RoPE Attention + Hopfield/SwiGLU Transformer for 2D time-frequency audio modeling."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-keywords = ["pytorch", "transformer", "rope", "triangle-roformer", "roformer", "audio", "language-model"]
+keywords = ["pytorch", "transformer", "rope", "triangle-roformer", "roformer", "audio", "source-separation", "hopfield"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

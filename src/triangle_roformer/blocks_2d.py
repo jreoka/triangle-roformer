@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .hopfield import HopfieldFFN, _resolve_num_heads
 from .rope import RotaryEmbedding
 
 
@@ -846,6 +847,273 @@ class CausalFreqTriangleRoPEBlock(TriangleRoPEBlock):
         o_0 = outs_0[0] if len(outs_0) == 1 else torch.cat(outs_0, dim=2)
         o_1 = outs_1[0] if len(outs_1) == 1 else torch.cat(outs_1, dim=2)
         return self._finish_block(x, o_0, o_1, out_gate)
+
+
+def _resolve_attn_heads(dim: int, heads: int | None) -> int:
+    resolved = _resolve_num_heads(dim, heads, target_head_dim=32)
+    head_dim = dim // resolved
+    if head_dim % 2 != 0:
+        raise ValueError(
+            f"RoPE attention requires an even head_dim; got dim={dim}, heads={resolved} "
+            f"(head_dim={head_dim})."
+        )
+    return resolved
+
+
+class RoPEAttentionBlock(nn.Module):
+    """Base standard multi-head RoPE softmax attention block for `[B, T, F, D]` grids.
+
+    Uses `F.scaled_dot_product_attention` with QK-RMSNorm and optional learnable
+    per-head null/sink key (`attn_sink=True`, paired with a zero value token so
+    queries can attend to "nothing" without breaking SDPA/FlashAttention).
+
+    Subclasses pair this with their fixed FFN:
+      - `TimeRoPEAttentionBlock`: SwiGLU FFN.
+      - `FreqRoPEAttentionBlock`: `HopfieldFFN`.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int | None = None,
+        axis: str = "time",
+        rope_base: float = 10_000.0,
+        dropout: float = 0.0,
+        residual_scale: float = 1.0,
+        freq_positions: torch.Tensor | None = None,
+        attn_sink: bool = True,
+    ):
+        super().__init__()
+        if axis not in ("time", "freq"):
+            raise ValueError(f"axis must be 'time' or 'freq', got {axis!r}.")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError(f"dropout must be in [0, 1), got {dropout}.")
+
+        resolved_heads = _resolve_attn_heads(dim, heads)
+        self.dim = dim
+        self.heads = resolved_heads
+        self.head_dim = dim // resolved_heads
+        self.axis = axis
+        self.dropout = dropout
+
+        self.attn_norm = nn.RMSNorm(dim)
+        self.qkv_proj = nn.Linear(dim, dim * 3, bias=False)
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
+        self.rope = RotaryEmbedding(self.head_dim, base=rope_base)
+        if axis == "freq":
+            if freq_positions is None:
+                raise ValueError(
+                    "Frequency-axis RoPE attention blocks require freq_positions "
+                    "(per-band log-frequency positions)."
+                )
+            freq_cos, freq_sin = self.rope.freq_tables(torch.as_tensor(freq_positions))
+            self.register_buffer("freq_cos", freq_cos, persistent=False)
+            self.register_buffer("freq_sin", freq_sin, persistent=False)
+        else:
+            self.register_buffer("freq_cos", None, persistent=False)
+            self.register_buffer("freq_sin", None, persistent=False)
+
+        if attn_sink:
+            self.sink_k: nn.Parameter | None = nn.Parameter(
+                torch.zeros(1, resolved_heads, 1, self.head_dim)
+            )
+        else:
+            self.register_parameter("sink_k", None)
+
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.ffn_norm = nn.RMSNorm(dim)
+        self.drop = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
+        in_std = 1.0 / math.sqrt(self.dim)
+        nn.init.normal_(self.qkv_proj.weight, std=in_std)
+        nn.init.normal_(self.out_proj.weight, std=in_std * residual_scale)
+
+    def _prepend_sink(
+        self, k: torch.Tensor, v: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.sink_k is None:
+            return k, v
+        batch_n = k.shape[0]
+        sk = self.sink_k.to(dtype=k.dtype).expand(batch_n, -1, -1, -1)
+        sv = torch.zeros_like(sk)
+        return torch.cat((sk, k), dim=-2), torch.cat((sv, v), dim=-2)
+
+
+class TimeRoPEAttentionBlock(RoPEAttentionBlock):
+    """Standard multi-head RoPE softmax attention along the time axis `T`
+    (independent per frequency band `F`) with SwiGLU FFN, for sharp
+    frame-to-frame recall alongside linear-time Triangle-RoPE contractions.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int | None = None,
+        causal: bool = False,
+        ffn_mult: float = 3.0,
+        rope_base: float = 10_000.0,
+        dropout: float = 0.0,
+        residual_scale: float = 1.0,
+        attn_sink: bool = True,
+    ):
+        super().__init__(
+            dim=dim,
+            heads=heads,
+            axis="time",
+            rope_base=rope_base,
+            dropout=dropout,
+            residual_scale=residual_scale,
+            attn_sink=attn_sink,
+        )
+        self.causal = causal
+        ffn_hidden = max(64, int(round(dim * ffn_mult / 64.0)) * 64)
+        self.ffn_in = nn.Linear(dim, ffn_hidden * 2, bias=False)
+        self.ffn_out = nn.Linear(ffn_hidden, dim, bias=False)
+        nn.init.normal_(self.ffn_in.weight, std=1.0 / math.sqrt(dim))
+        nn.init.normal_(
+            self.ffn_out.weight,
+            std=(1.0 / math.sqrt(ffn_hidden)) * residual_scale,
+        )
+
+    def _sdpa_mask(
+        self,
+        batch: int,
+        bands: int,
+        frames: int,
+        device: torch.device,
+        frame_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, bool]:
+        has_sink = self.sink_k is not None
+        if frame_mask is None:
+            if not self.causal:
+                return None, False
+            if not has_sink:
+                return None, True
+            tril = torch.tril(torch.ones(frames, frames, dtype=torch.bool, device=device))
+            sink_col = torch.ones(frames, 1, dtype=torch.bool, device=device)
+            mask = torch.cat((sink_col, tril), dim=-1)[None, None, :, :]
+            return mask, False
+
+        valid = frame_mask.to(device=device) > 0.5  # [B, T]
+        if self.causal:
+            tril = torch.tril(torch.ones(frames, frames, dtype=torch.bool, device=device))
+            m = tril[None, :, :] & valid[:, None, :]  # [B, T, T]
+            if has_sink:
+                sink_col = torch.ones(batch, frames, 1, dtype=torch.bool, device=device)
+                m = torch.cat((sink_col, m), dim=-1)  # [B, T, T + 1]
+            else:
+                m = m | (~m.any(dim=-1, keepdim=True))
+            m = m[:, None, None, :, :].expand(batch, bands, 1, frames, m.shape[-1])
+            return m.reshape(batch * bands, 1, frames, m.shape[-1]), False
+
+        if has_sink:
+            sink_col = torch.ones(batch, 1, dtype=torch.bool, device=device)
+            k_valid = torch.cat((sink_col, valid), dim=-1)  # [B, T + 1]
+        else:
+            k_valid = valid | (~valid.any(dim=-1, keepdim=True))
+        k_valid = k_valid[:, None, None, None, :].expand(
+            batch, bands, 1, 1, k_valid.shape[-1]
+        )
+        return k_valid.reshape(batch * bands, 1, 1, k_valid.shape[-1]), False
+
+    def forward(
+        self, x: torch.Tensor, frame_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        batch, frames, bands, dim = x.shape
+        h = self.attn_norm(x).permute(0, 2, 1, 3).reshape(batch * bands, frames, dim)
+        q, k, v = self.qkv_proj(h).chunk(3, dim=-1)
+        q = self.q_norm(
+            q.reshape(batch * bands, frames, self.heads, self.head_dim).transpose(1, 2)
+        )
+        k = self.k_norm(
+            k.reshape(batch * bands, frames, self.heads, self.head_dim).transpose(1, 2)
+        )
+        v = v.reshape(batch * bands, frames, self.heads, self.head_dim).transpose(1, 2)
+
+        q, k = self.rope.apply_qk(q, k)
+        k, v = self._prepend_sink(k, v)
+        attn_mask, is_causal = self._sdpa_mask(batch, bands, frames, x.device, frame_mask)
+        dropout_p = self.dropout if self.training else 0.0
+        o = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
+        )
+        o = (
+            o.transpose(1, 2)
+            .contiguous()
+            .reshape(batch, bands, frames, dim)
+            .permute(0, 2, 1, 3)
+        )
+        x = x + self.drop(self.out_proj(o))
+        ffn_gate, ffn_val = self.ffn_in(self.ffn_norm(x)).chunk(2, dim=-1)
+        ffn = F.silu(ffn_gate) * ffn_val
+        return x + self.drop(self.ffn_out(self.drop(ffn)))
+
+
+class FreqRoPEAttentionBlock(RoPEAttentionBlock):
+    """Per-frame multi-head RoPE softmax attention along the frequency axis `F`
+    (using interleaved log-frequency + band-index RoPE tables) paired with
+    `HopfieldFFN` for instantaneous harmonic routing + timbral prototype retrieval.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int | None = None,
+        rope_base: float = 1_000.0,
+        dropout: float = 0.0,
+        residual_scale: float = 1.0,
+        freq_positions: torch.Tensor | None = None,
+        attn_sink: bool = True,
+        hopfield_heads: int | None = None,
+        hopfield_patterns: int = 256,
+        hopfield_steps: int = 2,
+        hopfield_step_size: float = 1.0,
+    ):
+        super().__init__(
+            dim=dim,
+            heads=heads,
+            axis="freq",
+            rope_base=rope_base,
+            dropout=dropout,
+            residual_scale=residual_scale,
+            freq_positions=freq_positions,
+            attn_sink=attn_sink,
+        )
+        self.hopfield_ffn = HopfieldFFN(
+            dim=dim,
+            num_heads=hopfield_heads,
+            num_patterns=hopfield_patterns,
+            num_steps=hopfield_steps,
+            step_size=hopfield_step_size,
+            dropout=dropout,
+            residual_scale=residual_scale,
+            attn_sink=attn_sink,
+        )
+
+    def forward(
+        self, x: torch.Tensor, frame_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        del frame_mask  # strictly per-frame; padded frames cannot affect real frames
+        batch, frames, bands, dim = x.shape
+        h = self.attn_norm(x).reshape(batch * frames, bands, dim)
+        q, k, v = self.qkv_proj(h).chunk(3, dim=-1)
+        q = self.q_norm(
+            q.reshape(batch * frames, bands, self.heads, self.head_dim).transpose(1, 2)
+        )
+        k = self.k_norm(
+            k.reshape(batch * frames, bands, self.heads, self.head_dim).transpose(1, 2)
+        )
+        v = v.reshape(batch * frames, bands, self.heads, self.head_dim).transpose(1, 2)
+
+        assert self.freq_cos is not None and self.freq_sin is not None
+        q, k = self.rope.apply_qk_tables(q, k, self.freq_cos, self.freq_sin)
+        k, v = self._prepend_sink(k, v)
+        dropout_p = self.dropout if self.training else 0.0
+        o = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        o = o.transpose(1, 2).contiguous().reshape(batch, frames, bands, dim)
+        x = x + self.drop(self.out_proj(o))
+        return x + self.hopfield_ffn(self.ffn_norm(x))
 
 
 def make_freq_triangle_block(

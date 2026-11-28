@@ -5,7 +5,10 @@ import torch
 
 from triangle_roformer import (
     CausalFreqTriangleRoPEBlock,
+    FreqRoPEAttentionBlock,
     GlobalFreqTriangleRoPEBlock,
+    HopfieldFFN,
+    TimeRoPEAttentionBlock,
     TimeTriangleRoPEBlock,
     TriangleRoFormer2D,
     WindowedFreqTriangleRoPEBlock,
@@ -47,6 +50,7 @@ def test_2d_layer_schedule() -> None:
         freq_window=32,
         short_freq_window=8,
         time_window=64,
+        hopfield_patterns=32,
     )
     time_kinds = [
         (type(layer), getattr(layer, "time_window", 0), getattr(layer, "time_window_shift", 0))
@@ -56,25 +60,28 @@ def test_2d_layer_schedule() -> None:
         (TimeTriangleRoPEBlock, 0, 0),
         (WindowedTimeTriangleRoPEBlock, 64, 0),
         (TimeTriangleRoPEBlock, 0, 0),
-        (WindowedTimeTriangleRoPEBlock, 64, 32),
+        (TimeRoPEAttentionBlock, 0, 0),
         (TimeTriangleRoPEBlock, 0, 0),
         (WindowedTimeTriangleRoPEBlock, 64, 0),
         (TimeTriangleRoPEBlock, 0, 0),
-        (WindowedTimeTriangleRoPEBlock, 64, 32),
+        (TimeRoPEAttentionBlock, 0, 0),
     ]
     freq_kinds = [
-        (type(layer), layer.freq_window, layer.window_shift) for layer in model.freq_layers
+        (type(layer), getattr(layer, "freq_window", 0), getattr(layer, "window_shift", 0))
+        for layer in model.freq_layers
     ]
     assert freq_kinds == [
         (WindowedFreqTriangleRoPEBlock, 8, 0),
         (GlobalFreqTriangleRoPEBlock, 0, 0),
         (WindowedFreqTriangleRoPEBlock, 32, 0),
-        (GlobalFreqTriangleRoPEBlock, 0, 0),
+        (FreqRoPEAttentionBlock, 0, 0),
         (WindowedFreqTriangleRoPEBlock, 8, 4),
         (GlobalFreqTriangleRoPEBlock, 0, 0),
         (WindowedFreqTriangleRoPEBlock, 32, 16),
-        (GlobalFreqTriangleRoPEBlock, 0, 0),
+        (FreqRoPEAttentionBlock, 0, 0),
     ]
+    assert isinstance(model.freq_layers[3].hopfield_ffn, HopfieldFFN)
+    assert isinstance(model.freq_layers[7].hopfield_ffn, HopfieldFFN)
 
 
 @pytest.mark.parametrize("shift", [0, 3])
@@ -341,6 +348,104 @@ def test_new_parameters_receive_gradients(causal: bool) -> None:
     names = ("log_norm_floor", "sink_logit", "decay_logit", "band_emb")
     tracked = [(n, p) for n, p in model.named_parameters() if any(k in n for k in names)]
     assert any("decay_logit" in n for n, _ in tracked) == causal
+    for name, param in tracked:
+        assert param.grad is not None and torch.isfinite(param.grad).all(), name
+        assert param.grad.abs().sum() > 0, name
+
+
+# --------------------------------------------------------------------------
+# Hybrid RoPE attention + HopfieldFFN tests
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_steps", [1, 2, 3])
+def test_hopfield_ffn_shapes_and_gradients(num_steps: int) -> None:
+    torch.manual_seed(0)
+    ffn = HopfieldFFN(
+        dim=64, num_heads=4, num_patterns=32, num_steps=num_steps, attn_sink=True
+    )
+    x = torch.randn(2, 6, 8, 64, requires_grad=True)
+    y = ffn(x)
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+    y.square().mean().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    for name, param in ffn.named_parameters():
+        assert param.grad is not None and torch.isfinite(param.grad).all(), name
+        assert param.grad.abs().sum() > 0, name
+
+
+def test_hopfield_ffn_sink_suppresses_output() -> None:
+    torch.manual_seed(0)
+    ffn = HopfieldFFN(dim=32, num_heads=2, num_patterns=16, num_steps=2, attn_sink=True).eval()
+    x = torch.randn(1, 4, 6, 32)
+    y_normal = ffn(x)
+    with torch.no_grad():
+        ffn.sink_logit.fill_(25.0)
+    y_sunk = ffn(x)
+    assert y_sunk.abs().max() < 1e-4 * y_normal.abs().max()
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("attn_sink", [False, True])
+def test_rope_attention_blocks_frame_mask_and_causality(
+    causal: bool, attn_sink: bool
+) -> None:
+    torch.manual_seed(0)
+    model = TriangleRoFormer2D(
+        _band_freqs(6),
+        dim=32,
+        depth=4,
+        tri_dim=16,
+        causal=causal,
+        attn_sink=attn_sink,
+        hopfield_patterns=32,
+        hopfield_steps=2,
+        freq_window=4,
+        short_freq_window=2,
+        time_window=4,
+        chunk_size=3,
+    ).eval()
+
+    x = torch.randn(2, 10, 6, 32)
+    ref = model(x)
+
+    # Frame mask matches unpadded input
+    padded = torch.cat((x, 5.0 * torch.randn(2, 4, 6, 32)), dim=1)
+    mask = torch.ones(2, 14, dtype=torch.bool)
+    mask[:, 10:] = False
+    out = model(padded, frame_mask=mask)
+    torch.testing.assert_close(out[:, :10], ref, atol=1e-5, rtol=1e-5)
+
+    # Causal mode has zero future leakage
+    if causal:
+        x_mod = x.clone()
+        x_mod[:, 5:] = torch.randn_like(x_mod[:, 5:])
+        y_mod = model(x_mod)
+        torch.testing.assert_close(ref[:, :5], y_mod[:, :5], atol=1e-5, rtol=1e-5)
+        assert not torch.allclose(ref[:, 5:], y_mod[:, 5:])
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_hybrid_parameters_receive_gradients(causal: bool) -> None:
+    torch.manual_seed(0)
+    model = TriangleRoFormer2D(
+        _band_freqs(6),
+        dim=32,
+        depth=4,
+        tri_dim=16,
+        causal=causal,
+        hopfield_patterns=32,
+        hopfield_steps=2,
+        freq_window=4,
+        short_freq_window=2,
+        time_window=4,
+        chunk_size=3,
+    )
+    model(torch.randn(2, 9, 6, 32)).square().mean().backward()
+    names = ("sink_k", "hopfield_ffn.keys", "hopfield_ffn.values", "hopfield_ffn.log_beta", "hopfield_ffn.sink_logit")
+    tracked = [(n, p) for n, p in model.named_parameters() if any(k in n for k in names)]
+    assert len(tracked) > 0
     for name, param in tracked:
         assert param.grad is not None and torch.isfinite(param.grad).all(), name
         assert param.grad.abs().sum() > 0, name

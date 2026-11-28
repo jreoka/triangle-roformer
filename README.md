@@ -1,10 +1,12 @@
 # triangle-roformer
 
-An installable PyTorch library implementing the **Triangle-RoPE Transformer** — a linear-complexity relative-RoPE triangle multiplicative update architecture for **1D sequences** (language models, 1D audio/speech, time series) and **2D time-frequency grids** (audio source separation, spectrograms).
+An installable PyTorch library implementing **TriangleRoFormer2D** — a 2D axial time-frequency backbone for audio source separation and spectrogram modeling combining:
+
+- **Multi-scale linear-time Triangle-RoPE** multiplicative blocks + **SwiGLU** FFNs,
+- **Regular multi-head RoPE softmax attention** (`TimeRoPEAttentionBlock` & per-frame `FreqRoPEAttentionBlock`) on every 4th layer (`l % 4 == 3`) for sharp within-clip recall and instantaneous harmonic routing, and
+- **Modern Continuous Hopfield Network (`HopfieldFFN`)** FFNs inside the frequency RoPE attention blocks for learned timbral/harmonic prototype retrieval alongside SwiGLU everywhere else.
 
 ## Installation
-
-Unzip the archive and install with `pip`:
 
 ```bash
 pip install ./triangle-roformer
@@ -12,60 +14,9 @@ pip install ./triangle-roformer
 pip install -e ./triangle-roformer
 ```
 
-Requires Python `>=3.10` and `torch>=2.4.0` (uses `nn.RMSNorm`).
+Requires Python `>=3.10` and `torch>=2.4.0` (uses `nn.RMSNorm` and `F.scaled_dot_product_attention`).
 
 ## Quick Start
-
-### 1. 1D Sequence Backbone (Audio, Speech, Language, Time Series)
-
-```python
-import torch
-from triangle_roformer import TriangleRoFormer
-
-model = TriangleRoFormer(
-    dim=512,
-    depth=12,
-    heads=8,
-    causal=True,        # True for autoregressive, False for bidirectional
-    ffn_mult=3.0,
-    dropout=0.0,
-    drop_path=0.08,
-    use_checkpoint=False,
-)
-
-x = torch.randn(2, 128, 512)
-y = model(x)  # [2, 128, 512]
-```
-
-#### Incremental $O(1)$-Memory Autoregressive Decoding
-
-```python
-# Prefill prompt
-y_prompt, states = model(x[:, :64], return_states=True)
-
-# Decode 1 token at a time with constant state size
-y_next, states = model(x[:, 64:65], states=states, return_states=True)
-```
-
-### 2. Language / Discrete Token Model
-
-```python
-import torch
-from triangle_roformer import TriangleRoFormerLM
-
-lm = TriangleRoFormerLM(
-    vocab_size=32_000,
-    dim=512,
-    depth=12,
-    heads=8,
-    causal=True,
-)
-
-input_ids = torch.randint(0, 32_000, (2, 128))
-logits = lm(input_ids)  # [2, 128, 32000]
-```
-
-### 3. 2D Axial Time-Frequency Architecture (Spectrograms / MVSEP)
 
 ```python
 import torch
@@ -78,7 +29,7 @@ encoder = TriangleRoFormer2D(
     band_freqs_hz,
     dim=256,
     depth=14,
-    tri_dim=128,          # or heads=64 (in 2D blocks, heads = tri_dim // 2)
+    tri_dim=128,          # or heads=64 (in Triangle-RoPE blocks, heads = tri_dim // 2)
     causal=False,         # False for offline separation, True for causal time axis
     freq_window=32,       # long local pooling window for freq affinities (frames)
     short_freq_window=8,  # short local pooling window for freq affinities (frames)
@@ -88,56 +39,41 @@ encoder = TriangleRoFormer2D(
     drop_path=0.08,
     use_checkpoint=True,
     use_boundary_blocks=True,
+    hopfield_patterns=256,
+    hopfield_steps=2,
 )
 
 tokens = torch.randn(1, 64, 124, 256)  # [B, T, F, D]
 out = encoder(tokens)                  # [1, 64, 124, 256]
 ```
 
-#### Multi-scale layer schedule
-
-Every axial layer pairs one local and one chunk-wide contraction:
+### Fixed Hybrid Layer Schedule
 
 | layer `l` | time block `T_l` | freq block `B_l` |
 |---|---|---|
-| even | chunk-wide time contraction | windowed affinity, alternating `short_freq_window` / `freq_window` |
-| odd  | windowed time contraction over `time_window` frames | chunk-wide affinity |
+| `l % 4 == 0` | chunk-wide Triangle-RoPE + SwiGLU | windowed Triangle-RoPE (`short_freq_window` / `freq_window`) + SwiGLU |
+| `l % 4 == 1` | windowed Triangle-RoPE (`time_window`) + SwiGLU | chunk-wide Triangle-RoPE + SwiGLU |
+| `l % 4 == 2` | chunk-wide Triangle-RoPE + SwiGLU | windowed Triangle-RoPE (`freq_window` / `short_freq_window`) + SwiGLU |
+| `l % 4 == 3` | **TimeRoPEAttentionBlock** + SwiGLU | **FreqRoPEAttentionBlock** + **HopfieldFFN** |
 
-Windowed layers alternate a half-window shift so window seams move between layers.
-In causal mode, time blocks contract over an exponentially decayed causal prefix and
-frequency blocks pool their band affinity over the same kind of decayed prefix
-(`CausalFreqTriangleRoPEBlock`), each with a learnable per-channel decay whose
-half-lives are initialized log-spaced (multi-scale memory). `causal_decay=False`
-uses the plain running mean instead.
+### Log-frequency RoPE
 
-#### Log-frequency RoPE
+Both Triangle-RoPE and regular RoPE attention on the frequency axis rotate half of their RoPE pairs by **log-frequency positions** (`12 * log2(hz / 20)`, semitones), so a harmonic ratio such as an octave is the same relative offset for every fundamental, and the other half by band index (linear harmonic-comb spacing).
 
-Frequency-axis blocks rotate half of their RoPE pairs by **log-frequency positions**
-(`12 * log2(hz / 20)`, semitones), so a harmonic ratio such as an octave is the same
-relative offset for every fundamental, and the other half by band index (linear
-harmonic-comb spacing). This is why `TriangleRoFormer2D` requires `band_freqs_hz`.
-
-#### Separation-oriented options
-
-All on by default except `band_embedding`:
+### Separation-oriented options
 
 | option | what it does |
 |---|---|
-| `soft_norm=True`, `norm_floor_init=0.5` | Time transfer matrices and frequency affinity logits are divided by `sqrt(rms² + floor²/n)` rather than by their own RMS (`n` = frames pooled, `floor` learnable per channel). Sampling noise of a mean over `n` frames scales like `1/sqrt(n)`, so the floor sits at the noise level for every window size and chunk length: noise-level correlations stay weak instead of being rescaled to look like strong ones. |
-| `attn_sink=True` | Every frequency softmax gets a learnable per-channel null logit with a zero value, so a band can attend to "nothing" (e.g. when the target source is absent) instead of averaging other bands. |
-| `causal_decay=True` | Causal mode only: decayed prefix (see above). |
-| `band_embedding=False` | Optional zero-initialized `[F, dim]` absolute band embedding. Unnecessary if the front end already uses per-band projections. |
+| `soft_norm=True`, `norm_floor_init=0.5` | Time transfer matrices and frequency affinity logits are divided by `sqrt(rms² + floor²/n)` rather than by their own RMS (`n` = frames pooled, `floor` learnable per channel). |
+| `attn_sink=True` | Adds a learnable per-head null/sink option with zero value to frequency Triangle-RoPE, regular RoPE attention (`sink_k`), and `HopfieldFFN` (`sink_logit`). |
+| `causal_decay=True` | Causal mode only: exponentially decayed prefix with learnable log-spaced per-channel half-lives. |
+| `band_embedding=False` | Optional zero-initialized `[F, dim]` absolute band embedding. |
 
-`soft_norm=False, attn_sink=False` reproduce the 0.2.x non-causal blocks and load
-their checkpoints unchanged. The one difference is that shifted windowed-frequency
-edge windows now average over their real frame count instead of the full window.
-
-#### Padding mask
+### Padding mask
 
 ```python
 # frame_mask: [B, T], 1 = real frame. Padded frames are excluded from every
-# time-pooled statistic (chunk-wide, windowed, causal prefix, boundary-block GRN),
-# so real frames get the same output as for the unpadded input.
+# time-pooled statistic, time attention, and boundary-block GRN.
 out = encoder(tokens, frame_mask=frame_mask)
 ```
 
