@@ -1,3 +1,5 @@
+<img width="2752" height="1536" alt="Gemini_Generated_Image_w22x39w22x39w22x" src="https://github.com/user-attachments/assets/b1538824-8722-4a09-86c5-98a951093c34" />
+
 # triangle-roformer
 
 An installable PyTorch library implementing **TriangleRoFormer2D** — a 2D axial time-frequency backbone for audio source separation and spectrogram modeling combining:
