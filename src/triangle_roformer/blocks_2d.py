@@ -239,7 +239,11 @@ class TriangleRoPEBlock(nn.Module):
             self.sink_logit = nn.Parameter(torch.zeros(resolved_tri_dim // 2))
         else:
             self.register_parameter("sink_logit", None)
-        self.tri_out_norm = nn.RMSNorm(resolved_tri_dim)
+        # Skip post-readout RMSNorm on freq blocks with attn_sink so all-head
+        # sink suppression isn't rescaled back to unit RMS (c is already c_norm'd).
+        self.tri_out_norm: nn.Module = (
+            nn.Identity() if (axis == "freq" and attn_sink) else nn.RMSNorm(resolved_tri_dim)
+        )
         self.tri_out = nn.Linear(resolved_tri_dim, dim, bias=False)
 
         self.ffn_norm = nn.RMSNorm(dim)
@@ -1045,8 +1049,9 @@ class RoPEAttentionBlock(nn.Module):
     """Base standard multi-head RoPE softmax attention block for `[B, T, F, D]` grids.
 
     Uses `F.scaled_dot_product_attention` with QK-RMSNorm and optional learnable
-    per-head null/sink key (`attn_sink=True`, paired with a zero value token so
-    queries can attend to "nothing" without breaking SDPA/FlashAttention).
+    per-head position-invariant null/sink logit (`attn_sink=True`, implemented via
+    a padded coordinate with a zero value token so queries can attend to "nothing"
+    without position-dependent RoPE oscillation or breaking SDPA/FlashAttention).
 
     Subclasses pair this with their fixed FFN:
       - `TimeRoPEAttentionBlock`: SwiGLU FFN.
@@ -1096,11 +1101,11 @@ class RoPEAttentionBlock(nn.Module):
             self.register_buffer("freq_sin", None, persistent=False)
 
         if attn_sink:
-            self.sink_k: nn.Parameter | None = nn.Parameter(
-                torch.zeros(1, resolved_heads, 1, self.head_dim)
+            self.sink_logit: nn.Parameter | None = nn.Parameter(
+                torch.zeros(resolved_heads)
             )
         else:
-            self.register_parameter("sink_k", None)
+            self.register_parameter("sink_logit", None)
 
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.ffn_norm = nn.RMSNorm(dim)
@@ -1110,14 +1115,34 @@ class RoPEAttentionBlock(nn.Module):
         nn.init.normal_(self.qkv_proj.weight, std=in_std)
         nn.init.normal_(self.out_proj.weight, std=in_std * residual_scale)
 
-    def _prepend_sink(
-        self, k: torch.Tensor, v: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.sink_k is None:
-            return k, v
-        batch_n = k.shape[0]
-        sk = self.sink_k.to(dtype=k.dtype).expand(batch_n, -1, -1, -1)
-        return torch.cat((sk, k), dim=-2), F.pad(v, (0, 0, 1, 0))
+    def _prepare_sdpa_qkv(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+        """Prepare `(q, k, v, scale)` for fused SDPA. When `attn_sink=True`,
+        pads `head_dim` to a multiple of 8 so the prepended sink token carries an
+        exact position-invariant scalar `sink_logit` (unaffected by RoPE on `q`)."""
+        scale = 1.0 / math.sqrt(self.head_dim)
+        if self.sink_logit is None:
+            return q, k, v, scale
+        pad_d = 8 - (self.head_dim % 8)
+        d_ext = self.head_dim + pad_d
+        q_ext = F.pad(q, (0, pad_d), value=1.0)
+        k_real = F.pad(k, (0, pad_d))
+        sink_val = (
+            (self.sink_logit.float() * math.sqrt(self.head_dim))
+            .to(dtype=k.dtype)
+            .view(1, self.heads, 1, 1)
+        )
+        k_sink = torch.cat(
+            (
+                torch.zeros(1, self.heads, 1, d_ext - 1, device=k.device, dtype=k.dtype),
+                sink_val,
+            ),
+            dim=-1,
+        ).expand(k.shape[0], -1, -1, -1)
+        k_all = torch.cat((k_sink, k_real), dim=-2)
+        v_ext = F.pad(v, (0, pad_d, 1, 0))
+        return q_ext, k_all, v_ext, scale
 
 
 class TimeRoPEAttentionBlock(RoPEAttentionBlock):
@@ -1164,7 +1189,7 @@ class TimeRoPEAttentionBlock(RoPEAttentionBlock):
         device: torch.device,
         frame_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, bool]:
-        has_sink = self.sink_k is not None
+        has_sink = self.sink_logit is not None
         if frame_mask is None:
             if not self.causal:
                 return None, False
@@ -1212,12 +1237,14 @@ class TimeRoPEAttentionBlock(RoPEAttentionBlock):
         v = v.reshape(batch * bands, frames, self.heads, self.head_dim).transpose(1, 2)
 
         q, k = self.rope.apply_qk(q, k)
-        k, v = self._prepend_sink(k, v)
+        q, k, v, scale = self._prepare_sdpa_qkv(q, k, v)
         attn_mask, is_causal = self._sdpa_mask(batch, bands, frames, x.device, frame_mask)
         dropout_p = self.dropout if self.training else 0.0
         o = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
+            q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
         )
+        if self.sink_logit is not None:
+            o = o[..., : self.head_dim]
         o = self.out_proj(
             o.transpose(1, 2).reshape(batch, bands, frames, dim)
         ).permute(0, 2, 1, 3)
@@ -1285,9 +1312,11 @@ class FreqRoPEAttentionBlock(RoPEAttentionBlock):
 
         assert self.freq_cos is not None and self.freq_sin is not None
         q, k = self.rope.apply_qk_tables(q, k, self.freq_cos, self.freq_sin)
-        k, v = self._prepend_sink(k, v)
+        q, k, v, scale = self._prepare_sdpa_qkv(q, k, v)
         dropout_p = self.dropout if self.training else 0.0
-        o = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        o = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, scale=scale)
+        if self.sink_logit is not None:
+            o = o[..., : self.head_dim]
         o = o.transpose(1, 2).reshape(batch, frames, bands, dim)
         x = x + self.drop(self.out_proj(o))
         return x + self.hopfield_ffn(self.ffn_norm(x))

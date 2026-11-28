@@ -80,20 +80,18 @@ class HopfieldFFN(nn.Module):
         )
         self.values = nn.Parameter(
             torch.randn(resolved_heads, num_patterns, self.head_dim)
-            * (self.head_dim ** -0.5)
         )
         init_beta = max(_BETA_MIN, min(_BETA_MAX, math.sqrt(self.head_dim)))
+        # 1D parameters (no weight decay under standard ndim >= 2 filters)
         self.log_beta = nn.Parameter(
-            torch.full((resolved_heads, 1, 1), math.log(init_beta))
+            torch.full((resolved_heads,), math.log(init_beta))
         )
         if attn_sink:
             self.sink_logit: nn.Parameter | None = nn.Parameter(
-                torch.zeros(resolved_heads, 1, 1)
+                torch.zeros(resolved_heads)
             )
         else:
             self.register_parameter("sink_logit", None)
-
-        self.out_norm = nn.RMSNorm(dim)
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.drop = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         self._init_weights(residual_scale)
@@ -130,6 +128,7 @@ class HopfieldFFN(nn.Module):
             self.log_beta.float()
             .clamp(math.log(_BETA_MIN), math.log(_BETA_MAX))
             .exp()
+            .view(-1, 1, 1)
             .to(dtype=x.dtype)
         )
         keys_scaled = keys * beta  # [H, M, d_h]
@@ -145,22 +144,37 @@ class HopfieldFFN(nn.Module):
             pad_d = 8 - (self.head_dim % 8)
             d_ext = self.head_dim + pad_d
             k_real = F.pad(keys_scaled, (0, pad_d))
-            k_sink = torch.zeros(
-                self.num_heads, 1, d_ext, device=x.device, dtype=x.dtype
+            k_sink = torch.cat(
+                (
+                    torch.zeros(
+                        self.num_heads, 1, d_ext - 1, device=x.device, dtype=x.dtype
+                    ),
+                    self.sink_logit.to(dtype=x.dtype).view(self.num_heads, 1, 1),
+                ),
+                dim=-1,
             )
-            k_sink[..., -1] = self.sink_logit.to(dtype=x.dtype).squeeze(-1)
             k_all = (
                 torch.cat((k_real, k_sink), dim=-2)
                 .unsqueeze(0)
                 .expand(b_outer, -1, -1, -1)
             )
-            v_keys = (
-                F.pad(keys, (0, pad_d, 0, 1))
-                .unsqueeze(0)
-                .expand(b_outer, -1, -1, -1)
-                if self.num_steps > 1
-                else None
-            )
+            if self.num_steps > 1:
+                # Store 1.0 in the last padded coordinate for real keys and 0.0
+                # for the sink so SDPA returns exact non-sink mass (1 - w_sink)
+                # in `retrieved[..., -1:]` with no extra kernel or allocation.
+                real_flag = torch.ones(
+                    self.num_heads, self.num_patterns, 1, device=x.device, dtype=x.dtype
+                )
+                v_keys_real = torch.cat(
+                    (F.pad(keys, (0, pad_d - 1)), real_flag), dim=-1
+                )
+                v_keys = (
+                    F.pad(v_keys_real, (0, 0, 0, 1))
+                    .unsqueeze(0)
+                    .expand(b_outer, -1, -1, -1)
+                )
+            else:
+                v_keys = None
             v_vals = (
                 F.pad(vals, (0, pad_d, 0, 1))
                 .unsqueeze(0)
@@ -177,24 +191,37 @@ class HopfieldFFN(nn.Module):
 
         dropout_p = self.dropout if self.training else 0.0
         out: torch.Tensor | None = None
+        mass: torch.Tensor | float = 1.0
         for step in range(self.num_steps):
-            xi_norm = (
-                xi
-                if step == 0
-                else F.normalize(xi.float(), dim=-1, eps=1e-6).to(dtype=x.dtype)
-            )
-            q_in = F.pad(xi_norm, (0, pad_d), value=1.0) if has_sink else xi_norm
+            if step == 0:
+                xi_in = xi
+            else:
+                xi_unit = F.normalize(xi.float(), dim=-1, eps=1e-6)
+                xi_in = (
+                    (xi_unit * mass).to(dtype=x.dtype)
+                    if has_sink
+                    else xi_unit.to(dtype=x.dtype)
+                )
+            q_in = F.pad(xi_in, (0, pad_d), value=1.0) if has_sink else xi_in
             if step < self.num_steps - 1:
                 assert v_keys is not None
-                retrieved = F.scaled_dot_product_attention(
+                retrieved_ext = F.scaled_dot_product_attention(
                     q_in, k_all, v_keys, scale=1.0
                 )
                 if has_sink:
-                    retrieved = retrieved[..., : self.head_dim]
+                    retrieved = retrieved_ext[..., : self.head_dim]
+                    p_real = retrieved_ext[..., -1:].float()
+                    mass = (
+                        p_real
+                        if self.step_size == 1.0
+                        else mass + self.step_size * (p_real - mass)
+                    )
+                else:
+                    retrieved = retrieved_ext
                 if self.step_size == 1.0:
                     xi = retrieved
                 else:
-                    xi = xi_norm + self.step_size * (retrieved - xi_norm)
+                    xi = xi_in + self.step_size * (retrieved - xi_in)
             else:
                 out = F.scaled_dot_product_attention(
                     q_in, k_all, v_vals, dropout_p=dropout_p, scale=1.0
@@ -204,5 +231,5 @@ class HopfieldFFN(nn.Module):
 
         assert out is not None
         out = out.transpose(1, 2).reshape(*lead, self.dim)
-        out = self.out_proj(self.out_norm(out)) * torch.sigmoid(out_gate)
+        out = self.out_proj(out) * torch.sigmoid(out_gate)
         return self.drop(out)

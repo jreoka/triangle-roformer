@@ -67,7 +67,7 @@ Both Triangle-RoPE and regular RoPE attention on the frequency axis rotate half 
 | option | what it does |
 |---|---|
 | `soft_norm=True`, `norm_floor_init=0.5` | Time transfer matrices and frequency affinity logits are divided by `sqrt(rms² + floor²/n)` rather than by their own RMS (`n` = frames pooled, `floor` learnable per channel). |
-| `attn_sink=True` | Adds a learnable per-head null/sink option with zero value to frequency Triangle-RoPE, regular RoPE attention (`sink_k`), and `HopfieldFFN` (`sink_logit`). |
+| `attn_sink=True` | Adds a learnable per-head null/sink option with zero value to frequency Triangle-RoPE, regular RoPE attention (`sink_logit`), and `HopfieldFFN` (`sink_logit`). |
 | `causal_decay=True` | Causal mode only: exponentially decayed prefix with learnable log-spaced per-channel half-lives. |
 | `band_embedding=False` | Optional zero-initialized `[F, dim]` absolute band embedding. |
 

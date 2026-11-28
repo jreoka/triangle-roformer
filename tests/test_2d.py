@@ -443,7 +443,7 @@ def test_hybrid_parameters_receive_gradients(causal: bool) -> None:
         chunk_size=3,
     )
     model(torch.randn(2, 9, 6, 32)).square().mean().backward()
-    names = ("sink_k", "hopfield_ffn.keys", "hopfield_ffn.values", "hopfield_ffn.log_beta", "hopfield_ffn.sink_logit")
+    names = ("sink_logit", "hopfield_ffn.keys", "hopfield_ffn.values", "hopfield_ffn.log_beta")
     tracked = [(n, p) for n, p in model.named_parameters() if any(k in n for k in names)]
     assert len(tracked) > 0
     for name, param in tracked:
@@ -493,19 +493,27 @@ def test_hopfield_ffn_matches_explicit_attention(
     xi = xi_raw.reshape(-1, ffn.num_heads, ffn.head_dim).transpose(0, 1)
     xi = torch.nn.functional.normalize(xi.float(), dim=-1, eps=1e-6)
     keys = torch.nn.functional.normalize(ffn.keys.float(), dim=-1, eps=1e-6)
-    beta = ffn.log_beta.float().clamp(torch.log(torch.tensor(0.5)), torch.log(torch.tensor(32.0))).exp()
+    beta = ffn.log_beta.float().clamp(torch.log(torch.tensor(0.5)), torch.log(torch.tensor(32.0))).exp().view(-1, 1, 1)
+    mass: torch.Tensor | float = 1.0
     for step in range(ffn.num_steps):
-        xi_n = xi if step == 0 else torch.nn.functional.normalize(xi, dim=-1, eps=1e-6)
+        if step == 0:
+            xi_n = xi
+        else:
+            xi_u = torch.nn.functional.normalize(xi, dim=-1, eps=1e-6)
+            xi_n = xi_u * mass if attn_sink else xi_u
         logits = torch.matmul(xi_n, keys.transpose(-2, -1)) * beta
         if attn_sink:
-            sink = ffn.sink_logit.float().expand(logits.shape[0], logits.shape[1], 1)
+            sink = ffn.sink_logit.float().view(-1, 1, 1).expand(logits.shape[0], logits.shape[1], 1)
             weights = torch.softmax(torch.cat((logits, sink), dim=-1), dim=-1)[..., :-1]
         else:
             weights = torch.softmax(logits, dim=-1)
         if step < ffn.num_steps - 1:
+            if attn_sink:
+                p_real = weights.sum(dim=-1, keepdim=True)
+                mass = p_real if step_size == 1.0 else mass + step_size * (p_real - mass)
             xi = xi_n + step_size * (torch.matmul(weights, keys) - xi_n)
     out = torch.matmul(weights, ffn.values.float()).transpose(0, 1).reshape_as(x)
-    ref = ffn.out_proj(ffn.out_norm(out)) * torch.sigmoid(out_gate)
+    ref = ffn.out_proj(out) * torch.sigmoid(out_gate)
     torch.testing.assert_close(y, ref, atol=1e-5, rtol=1e-5)
 
 
@@ -532,3 +540,125 @@ def test_causal_time_matches_frame_by_frame_reference(causal_decay: bool) -> Non
     y16 = block_16(x, frame_mask=mask)
     torch.testing.assert_close(y3, y1, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(y3, y16, atol=1e-5, rtol=1e-5)
+
+
+def test_rope_attention_sink_matches_explicit_scalar_logit() -> None:
+    torch.manual_seed(0)
+    pos = log_frequency_positions(_band_freqs(6))
+    x = torch.randn(2, 8, 6, 32)
+
+    for block in (
+        TimeRoPEAttentionBlock(dim=32, heads=2, attn_sink=True).eval(),
+        FreqRoPEAttentionBlock(dim=32, heads=2, freq_positions=pos, attn_sink=True).eval(),
+    ):
+        with torch.no_grad():
+            block.sink_logit.copy_(torch.tensor([1.5, -0.75]))
+        y = block(x)
+
+        # Explicit reference with position-invariant scalar sink_logit
+        batch, frames, bands, dim = x.shape
+        if block.axis == "time":
+            h = block.attn_norm(x).permute(0, 2, 1, 3).reshape(batch * bands, frames, dim)
+            seq_len = frames
+        else:
+            h = block.attn_norm(x).reshape(batch * frames, bands, dim)
+            seq_len = bands
+        q, k, v = block.qkv_proj(h).chunk(3, dim=-1)
+        q = block.q_norm(q.reshape(-1, seq_len, block.heads, block.head_dim)).transpose(1, 2)
+        k = block.k_norm(k.reshape(-1, seq_len, block.heads, block.head_dim)).transpose(1, 2)
+        v = v.reshape(-1, seq_len, block.heads, block.head_dim).transpose(1, 2)
+        if block.axis == "time":
+            q, k = block.rope.apply_qk(q, k)
+        else:
+            q, k = block.rope.apply_qk_tables(q, k, block.freq_cos, block.freq_sin)
+        logits = torch.matmul(q.float(), k.float().transpose(-2, -1)) * (block.head_dim ** -0.5)
+        sink = block.sink_logit.float().view(1, block.heads, 1, 1).expand(logits.shape[0], -1, seq_len, 1)
+        weights = torch.softmax(torch.cat((sink, logits), dim=-1), dim=-1)[..., 1:]
+        o = torch.matmul(weights, v.float()).transpose(1, 2)
+        if block.axis == "time":
+            o = block.out_proj(o.reshape(batch, bands, frames, dim)).permute(0, 2, 1, 3)
+            x_mid = x + o
+            gate, val = block.ffn_in(block.ffn_norm(x_mid)).chunk(2, dim=-1)
+            ref = x_mid + block.ffn_out(torch.nn.functional.silu(gate) * val)
+        else:
+            o = block.out_proj(o.reshape(batch, frames, bands, dim))
+            x_mid = x + o
+            ref = x_mid + block.hopfield_ffn(block.ffn_norm(x_mid))
+        torch.testing.assert_close(y, ref, atol=1e-5, rtol=1e-5)
+
+        # Large sink_logit suppresses the attention residual cleanly
+        with torch.no_grad():
+            block.sink_logit.fill_(25.0)
+        y_sunk = block(x)
+        if block.axis == "time":
+            gate, val = block.ffn_in(block.ffn_norm(x)).chunk(2, dim=-1)
+            ref_no_attn = x + block.ffn_out(torch.nn.functional.silu(gate) * val)
+        else:
+            ref_no_attn = x + block.hopfield_ffn(block.ffn_norm(x))
+        torch.testing.assert_close(y_sunk, ref_no_attn, atol=1e-5, rtol=1e-5)
+
+
+def test_hopfield_ffn_multistep_sink_preserves_shrinkage() -> None:
+    torch.manual_seed(0)
+    ffn = HopfieldFFN(
+        dim=32, num_heads=2, num_patterns=16, num_steps=2, step_size=1.0, attn_sink=True
+    ).eval()
+    # Set moderate sink_logit so step 0 puts most mass on sink (but not saturating fp32):
+    # with mass preserved, step 1 logits shrink toward 0 instead of snapping back to beta (~4.0).
+    with torch.no_grad():
+        ffn.sink_logit.fill_(5.0)
+    x = torch.randn(1, 4, 6, 32)
+    y_2step = ffn(x)
+
+    ffn_1step = HopfieldFFN(
+        dim=32, num_heads=2, num_patterns=16, num_steps=1, step_size=1.0, attn_sink=True
+    ).eval()
+    ffn_1step.load_state_dict(ffn.state_dict())
+    y_1step = ffn_1step(x)
+    # Step 2 should stay at least as suppressed as step 1 rather than rebounding.
+    assert y_2step.abs().mean() <= y_1step.abs().mean() * 1.1
+
+
+def test_scalar_control_params_are_1d_for_no_weight_decay() -> None:
+    model = TriangleRoFormer2D(
+        _band_freqs(6),
+        dim=32,
+        depth=4,
+        tri_dim=16,
+        hopfield_patterns=16,
+        freq_window=4,
+        short_freq_window=2,
+        time_window=4,
+    )
+    control_keys = ("sink_logit", "log_beta", "freq_scale", "log_norm_floor", "decay_logit")
+    matched = [
+        (name, param)
+        for name, param in model.named_parameters()
+        if any(k in name for k in control_keys)
+    ]
+    assert len(matched) > 0
+    for name, param in matched:
+        assert param.ndim == 1, f"{name} has shape {tuple(param.shape)}, expected 1D"
+
+
+def test_moderate_sink_suppresses_hopfield_and_freq_triangle_without_rms_blowup() -> None:
+    torch.manual_seed(0)
+    # Realistic sink_logit (~10.0, well above eps=1e-6 so RMSNorm would have cancelled it)
+    ffn = HopfieldFFN(dim=32, num_heads=2, num_patterns=16, num_steps=2, attn_sink=True).eval()
+    x = torch.randn(1, 4, 6, 32)
+    y_normal = ffn(x)
+    with torch.no_grad():
+        ffn.sink_logit.fill_(10.0)
+    y_sunk = ffn(x)
+    assert y_sunk.abs().mean() < 0.05 * y_normal.abs().mean()
+
+    pos = log_frequency_positions(_band_freqs(6))
+    freq_blk = GlobalFreqTriangleRoPEBlock(dim=32, tri_dim=16, freq_positions=pos, attn_sink=True).eval()
+    with torch.no_grad():
+        # Isolate the triangle residual from FFN by zeroing ffn_out
+        freq_blk.ffn_out.weight.zero_()
+    delta_normal = freq_blk(x) - x
+    with torch.no_grad():
+        freq_blk.sink_logit.fill_(10.0)
+    delta_sunk = freq_blk(x) - x
+    assert delta_sunk.abs().mean() < 0.05 * delta_normal.abs().mean()
