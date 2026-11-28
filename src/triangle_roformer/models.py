@@ -289,11 +289,23 @@ class TriangleRoFormer2D(nn.Module):
     log-frequency (semitone) positions on half of its rotary pairs so harmonic
     ratios are fixed offsets regardless of pitch, and band index on the other half.
 
+    Separation-oriented options (all blocks):
+      - `soft_norm` / `norm_floor_init`: confidence-preserving normalization of
+        time transfer matrices and frequency affinity logits (learnable floor).
+      - `attn_sink`: null logit in every frequency softmax.
+      - `band_embedding`: learned zero-initialized `[F, dim]` absolute band
+        embedding added to the input (off by default; unnecessary when the
+        front end already uses per-band projections).
+      - `forward(x, frame_mask=...)`: `[B, T]` mask (1 = real frame) that removes
+        padded frames from every time-pooled statistic (chunk-wide, windowed,
+        causal prefix, and the boundary blocks' GRN).
+
     When `causal=True`:
-      - All time-axis blocks run causally over the full prefix (frame `t` only
-        depends on frames `<= t`).
-      - Frequency-axis blocks use frame-local affinity (`freq_window=1, window_shift=0`)
-        so no future frames leak through cross-time frequency pooling.
+      - All time-axis blocks run causally over the prefix (frame `t` only depends
+        on frames `<= t`); with `causal_decay=True` the prefix is an exponentially
+        decayed mean with learnable per-channel decay.
+      - Frequency-axis blocks pool their affinity over the same kind of decayed
+        causal prefix (`CausalFreqTriangleRoPEBlock`) instead of the whole chunk.
     """
 
     def __init__(
@@ -315,6 +327,11 @@ class TriangleRoFormer2D(nn.Module):
         time_rope_base: float = 10_000.0,
         freq_rope_base: float = 1_000.0,
         chunk_size: int = 32,
+        soft_norm: bool = True,
+        norm_floor_init: float = 0.5,
+        attn_sink: bool = True,
+        causal_decay: bool = True,
+        band_embedding: bool = False,
     ):
         super().__init__()
         if dim <= 0 or depth <= 0:
@@ -340,8 +357,19 @@ class TriangleRoFormer2D(nn.Module):
 
         total_axial_pairs = depth + (2 if use_boundary_blocks else 0)
         res_scale = 1.0 / math.sqrt(2.0 * total_axial_pairs)
-        effective_window = 1 if causal else freq_window
         half_shift = 0 if causal else (freq_window // 2)
+        block_opts = dict(
+            soft_norm=soft_norm,
+            norm_floor_init=norm_floor_init,
+            causal_decay=causal_decay,
+        )
+
+        if band_embedding:
+            self.band_emb: nn.Parameter | None = nn.Parameter(
+                torch.zeros(self.num_bands, dim)
+            )
+        else:
+            self.register_parameter("band_emb", None)
 
         if use_boundary_blocks:
             self.pre_block: FineRateBoundaryBlock | None = FineRateBoundaryBlock(
@@ -350,11 +378,14 @@ class TriangleRoFormer2D(nn.Module):
                 heads=heads,
                 causal=causal,
                 ffn_mult=ffn_mult,
-                freq_window=effective_window,
+                freq_window=freq_window,
                 freq_window_shift=0,
                 dropout=dropout,
                 residual_scale=res_scale,
                 freq_positions=freq_positions,
+                chunk_size=chunk_size,
+                attn_sink=attn_sink,
+                **block_opts,
             )
         else:
             self.pre_block = None
@@ -379,6 +410,10 @@ class TriangleRoFormer2D(nn.Module):
                 dropout=dropout,
                 residual_scale=res_scale,
                 freq_positions=freq_positions,
+                causal=causal,
+                chunk_size=chunk_size,
+                attn_sink=attn_sink,
+                **block_opts,
             )
             for f_win, f_shift in freq_schedule
         )
@@ -395,6 +430,7 @@ class TriangleRoFormer2D(nn.Module):
                 window_shift=t_shift,
                 dropout=dropout,
                 residual_scale=res_scale,
+                **block_opts,
             )
             for t_win, t_shift in time_schedule
         )
@@ -412,11 +448,14 @@ class TriangleRoFormer2D(nn.Module):
                 heads=heads,
                 causal=causal,
                 ffn_mult=ffn_mult,
-                freq_window=effective_window,
+                freq_window=freq_window,
                 freq_window_shift=half_shift,
                 dropout=dropout,
                 residual_scale=res_scale,
                 freq_positions=freq_positions,
+                chunk_size=chunk_size,
+                attn_sink=attn_sink,
+                **block_opts,
             )
         else:
             self.geglu_fusion = None
@@ -428,9 +467,10 @@ class TriangleRoFormer2D(nn.Module):
     def _freq_window_for_layer(
         idx: int, causal: bool, long_window: int, short_window: int
     ) -> tuple[int, int]:
-        """(window, shift) for frequency layer `idx`; window 0 = chunk-wide."""
+        """(window, shift) for frequency layer `idx`; window 0 = chunk-wide.
+        Causal layers ignore it (decayed causal prefix)."""
         if causal:
-            return 1, 0
+            return 0, 0
         if idx % 2 == 1:
             return 0, 0
         window = short_window if (idx // 2) % 2 == 0 else long_window
@@ -463,10 +503,11 @@ class TriangleRoFormer2D(nn.Module):
         module: nn.Module,
         x: torch.Tensor,
         use_checkpoint: bool,
+        frame_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not use_checkpoint:
-            return module(x)
-        return checkpoint(module, x, use_reentrant=False)
+            return module(x, frame_mask)
+        return checkpoint(module, x, frame_mask, use_reentrant=False)
 
     def _drop_keep_mask(
         self,
@@ -489,7 +530,12 @@ class TriangleRoFormer2D(nn.Module):
         mask = mask_cpu.to(device=device, dtype=dtype, non_blocking=True)
         return mask / keep_prob
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, frame_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """`x`: `[B, T, F, D]`. `frame_mask`: optional `[B, T]` (bool or float,
+        1 = real frame); padded frames are excluded from all time-pooled
+        statistics. Outputs at padded frames are unspecified."""
         if x.ndim != 4:
             raise ValueError(f"Expected 4D input [B, T, F, D], got {tuple(x.shape)}.")
         if x.shape[2] != self.num_bands:
@@ -497,9 +543,18 @@ class TriangleRoFormer2D(nn.Module):
                 f"Model was built for {self.num_bands} bands (len(band_freqs_hz)) "
                 f"but input has {x.shape[2]}."
             )
+        if frame_mask is not None:
+            if frame_mask.shape != x.shape[:2]:
+                raise ValueError(
+                    f"frame_mask must be [B, T] = {tuple(x.shape[:2])}, "
+                    f"got {tuple(frame_mask.shape)}."
+                )
+            frame_mask = frame_mask.to(device=x.device, dtype=torch.float32)
         batch = x.shape[0]
         if torch.is_autocast_enabled(x.device.type):
             x = x.to(torch.get_autocast_dtype(x.device.type))
+        if self.band_emb is not None:
+            x = x + self.band_emb.to(dtype=x.dtype)
         should_checkpoint = (
             self.use_checkpoint and torch.is_grad_enabled() and x.requires_grad
         )
@@ -519,6 +574,7 @@ class TriangleRoFormer2D(nn.Module):
                 should_checkpoint=should_checkpoint,
                 keep_t=keep_pre_t,
                 keep_f=keep_pre_f,
+                frame_mask=frame_mask,
             )
 
             h = x_fine_skip
@@ -529,13 +585,13 @@ class TriangleRoFormer2D(nn.Module):
                 p_time = self.drop_path * block_offset / total_blocks
                 keep_t = self._drop_keep_mask(batch, p_time, h.device, h.dtype)
                 if not (isinstance(keep_t, float) and keep_t == 0.0):
-                    time_out = self._run_module(time_layer, h, should_checkpoint)
+                    time_out = self._run_module(time_layer, h, should_checkpoint, frame_mask)
                     h = time_out if keep_t is None else h + (time_out - h) * keep_t
 
                 p_freq = self.drop_path * (block_offset + 1) / total_blocks
                 keep_f = self._drop_keep_mask(batch, p_freq, h.device, h.dtype)
                 if not (isinstance(keep_f, float) and keep_f == 0.0):
-                    freq_out = self._run_module(freq_layer, h, should_checkpoint)
+                    freq_out = self._run_module(freq_layer, h, should_checkpoint, frame_mask)
                     h = freq_out if keep_f is None else h + (freq_out - h) * keep_f
 
             if should_checkpoint:
@@ -563,6 +619,7 @@ class TriangleRoFormer2D(nn.Module):
                 should_checkpoint=should_checkpoint,
                 keep_t=keep_post_t,
                 keep_f=keep_post_f,
+                frame_mask=frame_mask,
             )
             return self.output_norm(u)
 
@@ -575,13 +632,13 @@ class TriangleRoFormer2D(nn.Module):
             p_time = self.drop_path * block_offset / total_blocks
             keep_t = self._drop_keep_mask(batch, p_time, h.device, h.dtype)
             if not (isinstance(keep_t, float) and keep_t == 0.0):
-                time_out = self._run_module(time_layer, h, should_checkpoint)
+                time_out = self._run_module(time_layer, h, should_checkpoint, frame_mask)
                 h = time_out if keep_t is None else h + (time_out - h) * keep_t
 
             p_freq = self.drop_path * (block_offset + 1) / total_blocks
             keep_f = self._drop_keep_mask(batch, p_freq, h.device, h.dtype)
             if not (isinstance(keep_f, float) and keep_f == 0.0):
-                freq_out = self._run_module(freq_layer, h, should_checkpoint)
+                freq_out = self._run_module(freq_layer, h, should_checkpoint, frame_mask)
                 h = freq_out if keep_f is None else h + (freq_out - h) * keep_f
 
         return self.output_norm(h)

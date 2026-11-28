@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from triangle_roformer import (
+    CausalFreqTriangleRoPEBlock,
     GlobalFreqTriangleRoPEBlock,
     TimeTriangleRoPEBlock,
     TriangleRoFormer2D,
@@ -159,3 +160,187 @@ def test_2d_without_boundary_blocks() -> None:
     y = model(x)
     assert y.shape == x.shape
     assert torch.isfinite(y).all()
+
+
+# --------------------------------------------------------------------------
+# Separation-oriented options: frame mask, soft norm, sink, causal decay
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_frame_mask_matches_unpadded_input(causal: bool) -> None:
+    torch.manual_seed(0)
+    model = TriangleRoFormer2D(
+        _band_freqs(8),
+        dim=64,
+        depth=4,
+        tri_dim=32,
+        causal=causal,
+        freq_window=4,
+        short_freq_window=2,
+        time_window=4,
+        chunk_size=3,
+    ).eval()
+    x = torch.randn(2, 10, 8, 64)
+    ref = model(x)
+
+    padded = torch.cat((x, 5.0 * torch.randn(2, 5, 8, 64)), dim=1)
+    mask = torch.ones(2, 15, dtype=torch.bool)
+    mask[:, 10:] = False
+    out = model(padded, frame_mask=mask)
+    torch.testing.assert_close(out[:, :10], ref, atol=1e-5, rtol=1e-5)
+
+    if not causal:
+        # Without the mask the padding leaks into the real frames.
+        assert not torch.allclose(model(padded)[:, :10], ref, atol=1e-3)
+
+
+def test_frame_mask_per_sample_lengths() -> None:
+    torch.manual_seed(0)
+    model = TriangleRoFormer2D(
+        _band_freqs(6), dim=32, depth=2, tri_dim=16,
+        freq_window=4, short_freq_window=2, time_window=4,
+    ).eval()
+    x = torch.randn(2, 12, 6, 32)
+    mask = torch.ones(2, 12)
+    mask[1, 7:] = 0.0
+    out = model(x, frame_mask=mask)
+    torch.testing.assert_close(out[0], model(x[:1])[0], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out[1, :7], model(x[1:, :7])[0], atol=1e-5, rtol=1e-5)
+
+
+def test_frame_mask_shape_is_validated() -> None:
+    model = TriangleRoFormer2D(_band_freqs(4), dim=32, depth=1, tri_dim=16)
+    with pytest.raises(ValueError):
+        model(torch.randn(1, 6, 4, 32), frame_mask=torch.ones(1, 5))
+
+
+def test_soft_norm_keeps_weak_correlations_weak() -> None:
+    soft = TimeTriangleRoPEBlock(dim=32, tri_dim=16)
+    hard = TimeTriangleRoPEBlock(dim=32, tri_dim=16, soft_norm=False)
+    k_r, k_i = torch.randn(1, 8, 5, 10), torch.randn(1, 8, 5, 10)
+    inv_n = torch.full((1, 1, 1, 1), 1.0 / 64)
+
+    def norm(block, scale):
+        out_r, out_i = block._normalize_kernel(k_r * scale, k_i * scale, inv_n)
+        return (out_r.square() + out_i.square()).mean().sqrt().item()
+
+    # Hard normalization erases the correlation strength ...
+    assert norm(hard, 1e-2) == pytest.approx(norm(hard, 1.0), rel=1e-2)
+    # ... soft normalization keeps noise-level kernels small and strong ones ~unit.
+    assert norm(soft, 1.0) > 0.95
+    assert norm(soft, 1e-2) < 0.3  # ~1/4 of the 1/sqrt(n) noise level
+
+
+def test_attention_sink_lets_rows_attend_to_nothing() -> None:
+    pos = log_frequency_positions(_band_freqs(6))
+    with_sink = GlobalFreqTriangleRoPEBlock(dim=32, tri_dim=16, freq_positions=pos)
+    no_sink = GlobalFreqTriangleRoPEBlock(
+        dim=32, tri_dim=16, freq_positions=pos, attn_sink=False
+    )
+    m = torch.randn(2, 8, 6, 6)
+    inv_n = torch.full((1, 1, 1, 1), 0.1)
+    torch.testing.assert_close(
+        no_sink._freq_attention(m, inv_n).sum(-1), torch.ones(2, 8, 6)
+    )
+    with torch.no_grad():
+        with_sink.sink_logit.fill_(10.0)
+    assert (with_sink._freq_attention(m, inv_n).sum(-1) < 0.5).all()
+
+
+def test_causal_freq_without_decay_ends_at_global_affinity() -> None:
+    torch.manual_seed(0)
+    pos = log_frequency_positions(_band_freqs(6))
+    causal = CausalFreqTriangleRoPEBlock(
+        dim=32, tri_dim=16, freq_positions=pos, chunk_size=4, causal_decay=False
+    ).eval()
+    glob = GlobalFreqTriangleRoPEBlock(dim=32, tri_dim=16, freq_positions=pos).eval()
+    glob.load_state_dict(causal.state_dict())
+    x = torch.randn(2, 11, 6, 32)
+    # The last frame's prefix is the whole chunk.
+    torch.testing.assert_close(causal(x)[:, -1], glob(x)[:, -1], atol=1e-5, rtol=1e-5)
+
+
+def test_causal_freq_with_fast_decay_is_frame_local() -> None:
+    torch.manual_seed(0)
+    pos = log_frequency_positions(_band_freqs(6))
+    causal = CausalFreqTriangleRoPEBlock(
+        dim=32, tri_dim=16, freq_positions=pos, chunk_size=4
+    ).eval()
+    with torch.no_grad():
+        causal.freq_decay_logit.fill_(-40.0)
+    local = WindowedFreqTriangleRoPEBlock(
+        dim=32, tri_dim=16, freq_positions=pos, freq_window=1
+    ).eval()
+    local.load_state_dict(causal.state_dict(), strict=False)
+    x = torch.randn(2, 9, 6, 32)
+    torch.testing.assert_close(causal(x), local(x), atol=1e-5, rtol=1e-5)
+
+
+def test_causal_time_without_decay_ends_at_global_kernel() -> None:
+    torch.manual_seed(0)
+    causal = TimeTriangleRoPEBlock(
+        dim=32, tri_dim=16, causal=True, chunk_size=4, causal_decay=False
+    ).eval()
+    glob = TimeTriangleRoPEBlock(dim=32, tri_dim=16).eval()
+    glob.load_state_dict(causal.state_dict())
+    x = torch.randn(2, 11, 6, 32)
+    torch.testing.assert_close(causal(x)[:, -1], glob(x)[:, -1], atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("block_cls", ["time", "freq"])
+def test_causal_decay_is_chunk_size_invariant(block_cls: str) -> None:
+    torch.manual_seed(0)
+    pos = log_frequency_positions(_band_freqs(6))
+
+    def build(chunk: int):
+        torch.manual_seed(1)
+        if block_cls == "time":
+            return TimeTriangleRoPEBlock(dim=32, tri_dim=16, causal=True, chunk_size=chunk)
+        return CausalFreqTriangleRoPEBlock(
+            dim=32, tri_dim=16, freq_positions=pos, chunk_size=chunk
+        )
+
+    x = torch.randn(2, 13, 6, 32)
+    torch.testing.assert_close(build(3).eval()(x), build(64).eval()(x), atol=1e-5, rtol=1e-5)
+
+
+def test_causal_decay_reduces_old_frame_influence() -> None:
+    torch.manual_seed(0)
+    block = TimeTriangleRoPEBlock(dim=32, tri_dim=16, causal=True, chunk_size=8).eval()
+    with torch.no_grad():
+        block.time_decay_logit.fill_(0.0)  # gamma = 0.5 for every channel
+    x = torch.randn(1, 40, 6, 32)
+    x_mod = x.clone()
+    x_mod[:, :5] = torch.randn_like(x_mod[:, :5])
+    diff = (block(x) - block(x_mod)).abs().amax(dim=(0, 2, 3))
+    assert diff[-1] < 1e-4 * diff[5]
+
+
+def test_band_embedding_is_zero_initialized() -> None:
+    torch.manual_seed(0)
+    base = TriangleRoFormer2D(_band_freqs(6), dim=32, depth=2, tri_dim=16).eval()
+    emb = TriangleRoFormer2D(
+        _band_freqs(6), dim=32, depth=2, tri_dim=16, band_embedding=True
+    ).eval()
+    emb.load_state_dict(base.state_dict(), strict=False)
+    assert emb.band_emb is not None and emb.band_emb.shape == (6, 32)
+    x = torch.randn(1, 8, 6, 32)
+    torch.testing.assert_close(emb(x), base(x))
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_new_parameters_receive_gradients(causal: bool) -> None:
+    torch.manual_seed(0)
+    model = TriangleRoFormer2D(
+        _band_freqs(6), dim=32, depth=2, tri_dim=16, causal=causal,
+        freq_window=4, short_freq_window=2, time_window=4, chunk_size=4,
+        band_embedding=True,
+    )
+    model(torch.randn(2, 9, 6, 32)).square().mean().backward()
+    names = ("log_norm_floor", "sink_logit", "decay_logit", "band_emb")
+    tracked = [(n, p) for n, p in model.named_parameters() if any(k in n for k in names)]
+    assert any("decay_logit" in n for n, _ in tracked) == causal
+    for name, param in tracked:
+        assert param.grad is not None and torch.isfinite(param.grad).all(), name
+        assert param.grad.abs().sum() > 0, name

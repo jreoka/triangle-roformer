@@ -2,6 +2,7 @@
 
 from .blocks_1d import TriangleRoFormerBlock1D, TriangleRoFormerState
 from .blocks_2d import (
+    CausalFreqTriangleRoPEBlock,
     GlobalFreqTriangleRoPEBlock,
     TimeTriangleRoPEBlock,
     TriangleRoPEBlock,
@@ -14,7 +15,7 @@ from .layers import ConvNeXtV2TemporalMixer, FineRateBoundaryBlock, GEGLUFusion
 from .models import TriangleRoFormer, TriangleRoFormer2D, TriangleRoFormerLM
 from .rope import RotaryEmbedding, log_frequency_positions
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "__version__",
@@ -29,6 +30,7 @@ __all__ = [
     "WindowedTimeTriangleRoPEBlock",
     "GlobalFreqTriangleRoPEBlock",
     "WindowedFreqTriangleRoPEBlock",
+    "CausalFreqTriangleRoPEBlock",
     "make_freq_triangle_block",
     "make_time_triangle_block",
     "ConvNeXtV2TemporalMixer",
