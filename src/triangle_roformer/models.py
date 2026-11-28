@@ -6,8 +6,8 @@ from typing import Sequence
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 
+from ._compile import compile_unit, configure_dynamo_cache, run_unit
 from .blocks_1d import TriangleRoFormerBlock1D, TriangleRoFormerState
 from .blocks_2d import make_freq_triangle_block, make_time_triangle_block
 from .layers import FineRateBoundaryBlock, GEGLUFusion
@@ -15,14 +15,7 @@ from .rope import log_frequency_positions
 
 
 def _configure_dynamo_cache() -> None:
-    if hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "config"):
-        torch._dynamo.config.cache_size_limit = max(
-            int(getattr(torch._dynamo.config, "cache_size_limit", 8)), 64
-        )
-        if hasattr(torch._dynamo.config, "accumulated_cache_size_limit"):
-            torch._dynamo.config.accumulated_cache_size_limit = max(
-                int(torch._dynamo.config.accumulated_cache_size_limit), 256
-            )
+    configure_dynamo_cache()
 
 
 class TriangleRoFormer(nn.Module):
@@ -94,7 +87,7 @@ class TriangleRoFormer(nn.Module):
     def compile_layers(self, mode: str = "default") -> None:
         _configure_dynamo_cache()
         for layer in self.layers:
-            layer.compile(mode=mode, dynamic=False)
+            compile_unit(layer, mode=mode)
 
     def _drop_keep_mask(
         self,
@@ -167,12 +160,7 @@ class TriangleRoFormer(nn.Module):
                 )
                 next_states.append(new_state)
             elif should_checkpoint:
-                if attention_mask is None:
-                    out = checkpoint(layer, h, use_reentrant=False)
-                else:
-                    out = checkpoint(
-                        layer, h, attention_mask, use_reentrant=False
-                    )
+                out = run_unit(layer, True, h, attention_mask)
             else:
                 out = layer(
                     h,
@@ -492,9 +480,9 @@ class TriangleRoFormer2D(nn.Module):
         if self.pre_block is not None:
             self.pre_block.compile_layers(mode=mode)
         for unit in (*self.freq_layers, *self.time_layers):
-            unit.compile(mode=mode, dynamic=False)
+            compile_unit(unit, mode=mode)
         if self.geglu_fusion is not None:
-            self.geglu_fusion.compile(mode=mode, dynamic=False)
+            compile_unit(self.geglu_fusion, mode=mode)
         if self.post_block is not None:
             self.post_block.compile_layers(mode=mode)
 
@@ -505,9 +493,7 @@ class TriangleRoFormer2D(nn.Module):
         use_checkpoint: bool,
         frame_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if not use_checkpoint:
-            return module(x, frame_mask)
-        return checkpoint(module, x, frame_mask, use_reentrant=False)
+        return run_unit(module, use_checkpoint, x, frame_mask)
 
     def _drop_keep_mask(
         self,
@@ -594,12 +580,9 @@ class TriangleRoFormer2D(nn.Module):
                     freq_out = self._run_module(freq_layer, h, should_checkpoint, frame_mask)
                     h = freq_out if keep_f is None else h + (freq_out - h) * keep_f
 
-            if should_checkpoint:
-                y_fused = checkpoint(
-                    self.geglu_fusion, x_fine_skip, h, use_reentrant=False
-                )
-            else:
-                y_fused = self.geglu_fusion(x_fine_skip, h)
+            y_fused = run_unit(
+                self.geglu_fusion, should_checkpoint, x_fine_skip, h
+            )
 
             post_offset = 2 * (self.depth + 1)
             keep_post_t = self._drop_keep_mask(

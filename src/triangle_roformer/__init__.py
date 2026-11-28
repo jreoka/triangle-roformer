@@ -15,7 +15,7 @@ from .layers import ConvNeXtV2TemporalMixer, FineRateBoundaryBlock, GEGLUFusion
 from .models import TriangleRoFormer, TriangleRoFormer2D, TriangleRoFormerLM
 from .rope import RotaryEmbedding, log_frequency_positions
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "__version__",

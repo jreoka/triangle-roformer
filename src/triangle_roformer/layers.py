@@ -5,8 +5,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
+from ._compile import compile_unit, run_unit
 from .blocks_2d import TimeTriangleRoPEBlock, make_freq_triangle_block
 
 
@@ -154,9 +154,9 @@ class FineRateBoundaryBlock(nn.Module):
         )
 
     def compile_layers(self, mode: str = "default") -> None:
-        self.temporal_mixer.compile(mode=mode, dynamic=False)
-        self.time_layer.compile(mode=mode, dynamic=False)
-        self.freq_layer.compile(mode=mode, dynamic=False)
+        compile_unit(self.temporal_mixer, mode=mode)
+        compile_unit(self.time_layer, mode=mode)
+        compile_unit(self.freq_layer, mode=mode)
 
     @staticmethod
     def _run_unit(
@@ -165,9 +165,7 @@ class FineRateBoundaryBlock(nn.Module):
         use_checkpoint: bool,
         frame_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if not use_checkpoint:
-            return module(x, frame_mask)
-        return checkpoint(module, x, frame_mask, use_reentrant=False)
+        return run_unit(module, use_checkpoint, x, frame_mask)
 
     def forward(
         self,

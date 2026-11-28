@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "triangle-roformer"
-version = "0.3.0"
+version = "0.3.1"
 description = "Triangle RoFormer: Linear-complexity Triangle Multiplicative Update Transformer with Relative RoPE for 1D sequences (language, audio) and 2D time-frequency grids."
 readme = "README.md"
 requires-python = ">=3.10"
