@@ -51,27 +51,64 @@ def _decay_weights(
     return w, carry
 
 
+def _causal_time_weights(
+    log_gamma: torch.Tensor | None,
+    length: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Intra-chunk decay matrices `(w, w_sq, w_strict, carry, carry_sq)` for the
+    O(L^2 * F + L * F^2) algebraic causal time contraction."""
+    idx = torch.arange(length, device=device, dtype=torch.float32)
+    lag = idx[:, None] - idx[None, :]
+    lower = lag >= 0
+    strict = lag > 0
+    if log_gamma is None:
+        w = lower.float()[None]
+        carry = torch.ones(1, length, device=device)
+        return w, w, strict.float()[None], carry, carry
+    lg = log_gamma.float().to(device)
+    lag_pos = lag.clamp_min(0.0)[None]
+    w = torch.where(lower[None], torch.exp(lg.view(-1, 1, 1) * lag_pos), 0.0)
+    w_sq = torch.where(lower[None], torch.exp((2.0 * lg).view(-1, 1, 1) * lag_pos), 0.0)
+    w_strict = torch.where(strict[None], w, 0.0)
+    step = (idx + 1.0)[None]
+    carry = torch.exp(lg.view(-1, 1) * step)
+    carry_sq = torch.exp((2.0 * lg).view(-1, 1) * step)
+    return w, w_sq, w_strict, carry, carry_sq
+
+
 def _decayed_chunk_scan(
     delta: torch.Tensor,
     valid: torch.Tensor,
     w: torch.Tensor,
     carry: torch.Tensor,
-    state: torch.Tensor,
-    count: torch.Tensor,
+    state: torch.Tensor | None,
+    count: torch.Tensor | None,
+    use_cumsum: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decayed causal prefix sums over one chunk.
 
     delta: `[B, M, L, *rest]` per-frame terms (fp32), valid: `[B, L]` frame weights,
-    state: `[B, M, *rest]` carried sum, count: `[B, M]` carried weight.
-    Returns `cum [B, M, L, *rest]` and `n [B, M, L]` (decayed valid-frame counts).
+    state: optional `[B, M, *rest]` carried sum, count: optional `[B, M']` carried weight.
+    Returns `cum [B, M, L, *rest]` and `n [B, M', L]` (decayed valid-frame counts).
     """
     batch, m_ch, length = delta.shape[:3]
     rest = delta.shape[3:]
-    w = w.expand(m_ch, length, length)
+    if use_cumsum:
+        cum = delta.cumsum(dim=2)
+        n = valid.cumsum(dim=1)[:, None, :]
+        if state is not None:
+            cum = cum + state[:, :, None]
+        if count is not None:
+            n = n + count[:, :, None]
+        return cum, n
     flat = delta.reshape(batch, m_ch, length, -1)
-    cum = torch.einsum("mji,bmir->bmjr", w, flat)
-    cum = cum + carry[None, :, :, None] * state.reshape(batch, m_ch, 1, -1)
-    n = torch.einsum("mji,bi->bmj", w, valid) + carry[None] * count[:, :, None]
+    cum = torch.matmul(w, flat)
+    n = torch.matmul(w, valid[:, None, :, None]).squeeze(-1)
+    if state is not None:
+        cum = cum + carry[None, :, :, None] * state.reshape(batch, m_ch, 1, -1)
+    if count is not None:
+        n = n + carry[None] * count[:, :, None]
     return cum.reshape(batch, m_ch, length, *rest), n
 
 
@@ -238,6 +275,21 @@ class TriangleRoPEBlock(nn.Module):
         return a, b, c, out_gate
 
     @staticmethod
+    def _mask_abc_opt(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        c: torch.Tensor,
+        frame_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Zero (a, b, c) on padded frames when `frame_mask` is provided; avoids
+        allocating an all-ones mask when `frame_mask is None`."""
+        if frame_mask is None:
+            return a, b, c, None
+        valid = frame_mask.to(device=a.device, dtype=torch.float32)
+        m = valid.to(dtype=a.dtype)[:, :, None, None]
+        return a * m, b * m, c * m, valid
+
+    @staticmethod
     def _mask_abc(
         a: torch.Tensor,
         b: torch.Tensor,
@@ -257,17 +309,17 @@ class TriangleRoPEBlock(nn.Module):
         return param.float().view(1, -1, *([1] * (ndim - 2)))
 
     def _floor_sq(
-        self, ndim: int, inv_count: torch.Tensor
+        self, ndim: int, inv_count: torch.Tensor | float
     ) -> torch.Tensor | float:
         """Squared normalization floor `floor^2 / n` (or the plain eps without
-        `soft_norm`). `inv_count` (fp32, `1 / n`) must broadcast to the stats."""
+        `soft_norm`). `inv_count` (fp32 tensor or float, `1 / n`) must broadcast."""
         if self.log_norm_floor is None:
             return 1e-6
         floor = self.log_norm_floor.float().exp().clamp(_FLOOR_MIN, _FLOOR_MAX)
         return self._channel_view(floor.square(), ndim) * inv_count + 1e-6
 
     def _normalize_kernel(
-        self, k_r: torch.Tensor, k_i: torch.Tensor, inv_count: torch.Tensor
+        self, k_r: torch.Tensor, k_i: torch.Tensor, inv_count: torch.Tensor | float
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Phase-preserving joint normalization of `(K_r, K_i)` over source bands
         (dim -2). With `soft_norm`, divides by `sqrt(ms + floor^2 / n)` so the
@@ -276,7 +328,36 @@ class TriangleRoPEBlock(nn.Module):
         scale = torch.rsqrt(ms + self._floor_sq(ms.ndim, inv_count))
         return k_r * scale.to(dtype=k_r.dtype), k_i * scale.to(dtype=k_i.dtype)
 
-    def _freq_attention(self, m: torch.Tensor, inv_count: torch.Tensor) -> torch.Tensor:
+    def _normalize_kernel_packed(
+        self, k_ri: torch.Tensor, bands: int, inv_count: torch.Tensor | float
+    ) -> torch.Tensor:
+        """Phase-preserving joint normalization of packed `[..., 2*F, 2*F]` kernel."""
+        ms = (
+            k_ri.float()
+            .square()
+            .reshape(*k_ri.shape[:-2], 2, bands, k_ri.shape[-1])
+            .sum(dim=-3)
+            .mean(dim=-2, keepdim=True)
+        )
+        scale = torch.rsqrt(ms + self._floor_sq(ms.ndim, inv_count))
+        return k_ri * scale.to(dtype=k_ri.dtype)
+
+    def _sink_softmax(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.sink_logit is None:
+            return F.softmax(logits, dim=-1)
+        sink = self._channel_view(self.sink_logit, logits.ndim)
+        if torch.compiler.is_compiling():
+            m_max = torch.maximum(logits.amax(dim=-1, keepdim=True), sink)
+            exp_logits = (logits - m_max).exp()
+            denom = exp_logits.sum(dim=-1, keepdim=True) + (sink - m_max).exp()
+            return exp_logits / denom
+        return F.softmax(
+            torch.cat((logits, sink.expand(*logits.shape[:-1], 1)), dim=-1), dim=-1
+        )[..., :-1]
+
+    def _freq_attention(
+        self, m: torch.Tensor, inv_count: torch.Tensor | float
+    ) -> torch.Tensor:
         """Softmax over the last (source band) axis of a `[B, M, ..., F, F]`
         affinity, with optional soft normalization and a null (sink) logit."""
         assert self.freq_scale is not None
@@ -284,12 +365,28 @@ class TriangleRoPEBlock(nn.Module):
         ms = m_f.square().mean(dim=-1, keepdim=True)
         scale = self._channel_view(self.freq_scale.clamp(0.1, 20.0), m_f.ndim)
         logits = m_f * torch.rsqrt(ms + self._floor_sq(m_f.ndim, inv_count)) * scale
-        if self.sink_logit is None:
-            return F.softmax(logits, dim=-1)
-        sink = self._channel_view(self.sink_logit, m_f.ndim).expand(
-            *logits.shape[:-1], 1
-        )
-        return F.softmax(torch.cat((logits, sink), dim=-1), dim=-1)[..., :-1]
+        return self._sink_softmax(logits)
+
+    def _freq_attention_sum(
+        self, cum: torch.Tensor, count: torch.Tensor
+    ) -> torch.Tensor:
+        """Like `_freq_attention(cum / count, 1 / count)` without materializing
+        an intermediate `cum / count` copy."""
+        assert self.freq_scale is not None
+        cum_f = cum.float()
+        n_safe = count.clamp_min(1e-6)[..., None, None]
+        ms = cum_f.square().mean(dim=-1, keepdim=True)
+        if self.log_norm_floor is None:
+            floor_term = 1e-6 * n_safe.square()
+        else:
+            floor = self.log_norm_floor.float().exp().clamp(_FLOOR_MIN, _FLOOR_MAX)
+            floor_term = (
+                self._channel_view(floor.square(), cum_f.ndim) * n_safe
+                + 1e-6 * n_safe.square()
+            )
+        scale = self._channel_view(self.freq_scale.clamp(0.1, 20.0), cum_f.ndim)
+        logits = cum_f * torch.rsqrt(ms + floor_term) * scale
+        return self._sink_softmax(logits)
 
     def _apply_freq_rope(
         self, a: torch.Tensor, b: torch.Tensor
@@ -311,6 +408,20 @@ class TriangleRoPEBlock(nn.Module):
         """`[B, 1, 1, 1]` (fp32) reciprocal count of real frames in the chunk."""
         return (1.0 / valid.sum(dim=1).clamp_min(1.0)).view(-1, 1, 1, 1)
 
+    def _finish_block_packed(
+        self,
+        x: torch.Tensor,
+        tri: torch.Tensor,
+        out_gate: torch.Tensor,
+    ) -> torch.Tensor:
+        tri = self.tri_out(self.tri_out_norm(tri)) * torch.sigmoid(out_gate)
+        x = x + self.drop(tri)
+
+        h = self.ffn_norm(x)
+        ffn_gate, ffn_val = self.ffn_in(h).chunk(2, dim=-1)
+        ffn = F.silu(ffn_gate) * ffn_val
+        return x + self.drop(self.ffn_out(self.drop(ffn)))
+
     def _finish_block(
         self,
         x: torch.Tensor,
@@ -319,13 +430,7 @@ class TriangleRoPEBlock(nn.Module):
         out_gate: torch.Tensor,
     ) -> torch.Tensor:
         tri = torch.cat((o_0, o_1), dim=1).permute(0, 2, 3, 1).contiguous()
-        tri = self.tri_out(self.tri_out_norm(tri)) * torch.sigmoid(out_gate)
-        x = x + self.drop(tri)
-
-        h = self.ffn_norm(x)
-        ffn_gate, ffn_val = self.ffn_in(h).chunk(2, dim=-1)
-        ffn = F.silu(ffn_gate) * ffn_val
-        return x + self.drop(self.ffn_out(self.drop(ffn)))
+        return self._finish_block_packed(x, tri, out_gate)
 
 
 class TimeTriangleRoPEBlock(TriangleRoPEBlock):
@@ -386,90 +491,130 @@ class TimeTriangleRoPEBlock(TriangleRoPEBlock):
 
     def _causal_forward(
         self,
-        a_r: torch.Tensor,
-        a_i: torch.Tensor,
-        b_r: torch.Tensor,
-        b_i: torch.Tensor,
+        a_ri: torch.Tensor,
+        b_ri: torch.Tensor,
         c_cat: torch.Tensor,
-        valid: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch, m_ch, frames, bands = a_r.shape
-        two_f = c_cat.shape[-1]
+        valid: torch.Tensor | None,
+        bands: int,
+    ) -> torch.Tensor:
+        """Exact algebraic causal prefix contraction in O(B*M*T*(F^2 + L*F)) without
+        materializing 5D `[B, M, L, 2F, 2F]` chunk states."""
+        batch, m_ch, frames, _two_f = a_ri.shape
         inv_sqrt_f = 1.0 / math.sqrt(bands)
+        inv_f = 1.0 / bands
         log_gamma = (
             None
             if self.time_decay_logit is None
             else F.logsigmoid(self.time_decay_logit.float())
         )
+        use_cumsum = log_gamma is None
 
-        state = torch.zeros(
-            batch, m_ch, bands, 2 * two_f, device=a_r.device, dtype=torch.float32
-        )
-        count = torch.zeros(batch, m_ch, device=a_r.device, dtype=torch.float32)
+        state: torch.Tensor | None = None
+        count: torch.Tensor | None = None
         outputs: list[torch.Tensor] = []
+
+        full_len = min(self.chunk_size, frames)
+        full_weights = _causal_time_weights(log_gamma, full_len, a_ri.device)
 
         for start in range(0, frames, self.chunk_size):
             end = min(start + self.chunk_size, frames)
-            w, carry = _decay_weights(log_gamma, end - start, a_r.device)
-
-            ar_c = a_r[:, :, start:end, :].float()
-            ai_c = a_i[:, :, start:end, :].float()
-            br_c = b_r[:, :, start:end, :].float()
-            bi_c = b_i[:, :, start:end, :].float()
-            c_c = c_cat[:, :, start:end, :].float()
-
-            delta = torch.cat(
-                (br_c.unsqueeze(-1) * c_c.unsqueeze(-2), bi_c.unsqueeze(-1) * c_c.unsqueeze(-2)),
-                dim=-1,
-            )  # [B, M, L, F, 4F] = (real | imag)
-            cum, n = _decayed_chunk_scan(
-                delta, valid[:, start:end], w, carry, state, count
+            chunk_len = end - start
+            w, w_sq, w_strict, carry, carry_sq = (
+                full_weights
+                if chunk_len == full_len
+                else _causal_time_weights(log_gamma, chunk_len, a_ri.device)
             )
-            state = cum[:, :, -1]
-            count = n[:, :, -1]
 
-            inv_n = 1.0 / n.clamp_min(1e-6)[..., None, None]
-            kr_c, ki_c = self._normalize_kernel(*(cum * inv_n).chunk(2, dim=-1), inv_n)
+            a_c = a_ri[:, :, start:end].float()  # [B, M, L, 2F]
+            b_c = b_ri[:, :, start:end].float()  # [B, M, L, 2F]
+            c_c = c_cat[:, :, start:end].float()  # [B, M, L, 2F]
 
-            o_c = (
-                torch.matmul(ar_c.unsqueeze(-2), kr_c).squeeze(-2)
-                + torch.matmul(ai_c.unsqueeze(-2), ki_c).squeeze(-2)
-            ) * inv_sqrt_f
+            if valid is None:
+                n = w.sum(dim=-1)[None]  # [1, M', L]
+            elif use_cumsum:
+                n = valid[:, start:end].cumsum(dim=1)[:, None, :]  # [B, 1, L]
+            else:
+                n = torch.matmul(w, valid[:, None, start:end, None]).squeeze(-1)  # [B, M, L]
+            if count is not None:
+                n = n + carry[None] * count[:, :, None]
+
+            # Numerator U = carry * (a_c @ state) + ((a_c @ b_c^T) * w) @ c_c
+            ab_w = torch.matmul(a_c, b_c.transpose(-2, -1)) * w[None]  # [B, M, L, L]
+            u_c = torch.matmul(ab_w, c_c)
+
+            # Intra-chunk norm squared: ||sum_{i<=t} w[t,i] b_i c_i||^2
+            gram = torch.matmul(b_c, b_c.transpose(-2, -1))  # [B, M, L, L]
+            d_strict = torch.matmul(gram * w_strict[None], c_c)  # [B, M, L, 2F]
+            g_diag = gram.diagonal(dim1=-2, dim2=-1)[..., None]  # [B, M, L, 1]
+            dq = g_diag * c_c.square() + 2.0 * c_c * d_strict
+            sum_sq = dq.cumsum(dim=2) if use_cumsum else torch.matmul(w_sq[None], dq)
+
+            if state is not None:
+                u_c = u_c + carry[None, :, :, None] * torch.matmul(a_c, state)
+                state_sq = state.square().sum(dim=-2, keepdim=True)  # [B, M, 1, 2F]
+                bs_c = torch.matmul(b_c, state) * c_c
+                cross_scan = (
+                    bs_c.cumsum(dim=2) if use_cumsum else torch.matmul(w[None], bs_c)
+                )
+                sum_sq = (
+                    sum_sq
+                    + carry_sq[None, :, :, None] * state_sq
+                    + (2.0 * carry[None, :, :, None]) * cross_scan
+                )
+
+            inv_n = 1.0 / n.clamp_min(1e-6)[..., None]  # [B or 1, M', L, 1]
+            ms = sum_sq.clamp_min(0.0) * (inv_n.square() * inv_f)
+            scale = torch.rsqrt(ms + self._floor_sq(ms.ndim, inv_n))
+            o_c = (u_c * inv_n) * scale * inv_sqrt_f
             outputs.append(o_c.to(dtype=c_cat.dtype))
 
-        o_cat = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=2)
-        return o_cat.chunk(2, dim=-1)
+            if end < frames:
+                b_weighted = b_c * w[None, :, -1, :, None]
+                chunk_state = torch.matmul(b_weighted.transpose(-2, -1), c_c)
+                if state is None:
+                    state = chunk_state
+                else:
+                    state = carry[:, -1].view(1, -1, 1, 1) * state + chunk_state
+                count = n[:, :, -1]
+
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=2)
 
     def forward(
         self, x: torch.Tensor, frame_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
-        _batch, _frames, bands, _dim = x.shape
+        batch, frames, bands, _dim = x.shape
         a, b, c, out_gate = self._project_abc(x)
-        a, b, c, valid = self._mask_abc(a, b, c, frame_mask)
+        a, b, c, valid = self._mask_abc_opt(a, b, c, frame_mask)
 
         a_r, a_i, b_r, b_i = self.rope.apply_time(a, b)
-        c_0, c_1 = c.chunk(2, dim=-1)
+        m_ch = self.heads
+        a_ri = torch.cat((a_r, a_i), dim=2).permute(0, 3, 1, 2)  # [B, M, T, 2F]
+        b_ri = torch.cat((b_r, b_i), dim=2).permute(0, 3, 1, 2)  # [B, M, T, 2F]
+        c_cat = (
+            c.reshape(batch, frames, bands, 2, m_ch)
+            .permute(0, 4, 1, 3, 2)
+            .reshape(batch, m_ch, frames, 2 * bands)
+        )  # [B, M, T, 2F]
 
-        a_r = a_r.permute(0, 3, 1, 2)
-        a_i = a_i.permute(0, 3, 1, 2)
-        b_r = b_r.permute(0, 3, 1, 2)
-        b_i = b_i.permute(0, 3, 1, 2)
-        c_0 = c_0.permute(0, 3, 1, 2)
-        c_1 = c_1.permute(0, 3, 1, 2)
-
-        c_cat = torch.cat((c_0, c_1), dim=-1)  # [B, M, T, 2*F]
         if self.causal:
-            o_0, o_1 = self._causal_forward(a_r, a_i, b_r, b_i, c_cat, valid)
-            return self._finish_block(x, o_0, o_1, out_gate)
+            o_cat = self._causal_forward(a_ri, b_ri, c_cat, valid, bands)
+        else:
+            inv_t: torch.Tensor | float = (
+                1.0 / frames if valid is None else self._global_inv_count(valid)
+            )
+            inv_t_val = (
+                inv_t if isinstance(inv_t, float) else inv_t.to(dtype=c_cat.dtype)
+            )
+            k_ri = torch.matmul(b_ri.transpose(-2, -1), c_cat) * inv_t_val
+            k_ri = self._normalize_kernel_packed(k_ri, bands, inv_t)
+            o_cat = torch.matmul(a_ri, k_ri) * (1.0 / math.sqrt(bands))
 
-        inv_t = self._global_inv_count(valid)
-        inv_sqrt_f = 1.0 / math.sqrt(bands)
-        k_r = torch.matmul(b_r.transpose(-2, -1), c_cat) * inv_t.to(dtype=c_cat.dtype)
-        k_i = torch.matmul(b_i.transpose(-2, -1), c_cat) * inv_t.to(dtype=c_cat.dtype)
-        k_r, k_i = self._normalize_kernel(k_r, k_i, inv_t)
-        o_cat = (torch.matmul(a_r, k_r) + torch.matmul(a_i, k_i)) * inv_sqrt_f
-        o_0, o_1 = o_cat.chunk(2, dim=-1)
-        return self._finish_block(x, o_0, o_1, out_gate)
+        tri = (
+            o_cat.reshape(batch, m_ch, frames, 2, bands)
+            .permute(0, 2, 4, 3, 1)
+            .reshape(batch, frames, bands, 2 * m_ch)
+        )
+        return self._finish_block_packed(x, tri, out_gate)
 
 
 class WindowedTimeTriangleRoPEBlock(TriangleRoPEBlock):
@@ -526,50 +671,66 @@ class WindowedTimeTriangleRoPEBlock(TriangleRoPEBlock):
     ) -> torch.Tensor:
         batch, frames, bands, _dim = x.shape
         a, b, c, out_gate = self._project_abc(x)
-        a, b, c, valid = self._mask_abc(a, b, c, frame_mask)
+        a, b, c, valid = self._mask_abc_opt(a, b, c, frame_mask)
 
         a_r, a_i, b_r, b_i = self.rope.apply_time(a, b)
-        c_0, c_1 = c.chunk(2, dim=-1)
-
-        a_r = a_r.permute(0, 3, 1, 2)
-        a_i = a_i.permute(0, 3, 1, 2)
-        b_r = b_r.permute(0, 3, 1, 2)
-        b_i = b_i.permute(0, 3, 1, 2)
-        c_cat = torch.cat((c_0.permute(0, 3, 1, 2), c_1.permute(0, 3, 1, 2)), dim=-1)
+        m_ch = self.heads
+        two_f = 2 * bands
+        a_ri = torch.cat((a_r, a_i), dim=2).permute(0, 3, 1, 2)  # [B, M, T, 2F]
+        b_ri = torch.cat((b_r, b_i), dim=2).permute(0, 3, 1, 2)  # [B, M, T, 2F]
+        c_cat = (
+            c.reshape(batch, frames, bands, 2, m_ch)
+            .permute(0, 4, 1, 3, 2)
+            .reshape(batch, m_ch, frames, two_f)
+        )
 
         win = self.time_window
         shift = self.time_window_shift
         pad_right = (-(frames + shift)) % win
-        pad_spec = (0, 0, shift, pad_right)
-        a_r = F.pad(a_r, pad_spec)
-        a_i = F.pad(a_i, pad_spec)
-        b_r = F.pad(b_r, pad_spec)
-        b_i = F.pad(b_i, pad_spec)
-        c_cat = F.pad(c_cat, pad_spec)
+        needs_pad = shift > 0 or pad_right > 0
+        if needs_pad:
+            pad_spec = (0, 0, shift, pad_right)
+            a_ri = F.pad(a_ri, pad_spec)
+            b_ri = F.pad(b_ri, pad_spec)
+            c_cat = F.pad(c_cat, pad_spec)
 
-        padded_t = a_r.shape[2]
+        padded_t = a_ri.shape[2]
         num_win = padded_t // win
-        m_ch = a_r.shape[1]
-        two_f = c_cat.shape[-1]
 
-        a_rw = a_r.reshape(batch, m_ch, num_win, win, bands)
-        a_iw = a_i.reshape(batch, m_ch, num_win, win, bands)
-        b_rw = b_r.reshape(batch, m_ch, num_win, win, bands)
-        b_iw = b_i.reshape(batch, m_ch, num_win, win, bands)
+        a_riw = a_ri.reshape(batch, m_ch, num_win, win, two_f)
+        b_riw = b_ri.reshape(batch, m_ch, num_win, win, two_f)
         c_w = c_cat.reshape(batch, m_ch, num_win, win, two_f)
 
         # Number of real (unpadded, unmasked) frames per window, for an unbiased mean.
-        inv_count = self._window_inv_counts(valid, shift, pad_right, win)
+        if valid is None:
+            if needs_pad:
+                valid_1 = torch.ones(1, frames, device=x.device)
+                inv_count: torch.Tensor | float = self._window_inv_counts(
+                    valid_1, shift, pad_right, win
+                )
+            else:
+                inv_count = 1.0 / win
+        else:
+            inv_count = self._window_inv_counts(valid, shift, pad_right, win)
 
-        k_r = torch.matmul(b_rw.transpose(-2, -1), c_w) * inv_count.to(dtype=c_w.dtype)
-        k_i = torch.matmul(b_iw.transpose(-2, -1), c_w) * inv_count.to(dtype=c_w.dtype)
-        k_r, k_i = self._normalize_kernel(k_r, k_i, inv_count)
+        inv_val = (
+            inv_count
+            if isinstance(inv_count, float)
+            else inv_count.to(dtype=c_w.dtype)
+        )
+        k_ri = torch.matmul(b_riw.transpose(-2, -1), c_w) * inv_val
+        k_ri = self._normalize_kernel_packed(k_ri, bands, inv_count)
 
-        inv_sqrt_f = 1.0 / math.sqrt(bands)
-        o_w = (torch.matmul(a_rw, k_r) + torch.matmul(a_iw, k_i)) * inv_sqrt_f
-        o_cat = o_w.reshape(batch, m_ch, padded_t, two_f)[:, :, shift : shift + frames, :]
-        o_0, o_1 = o_cat.chunk(2, dim=-1)
-        return self._finish_block(x, o_0, o_1, out_gate)
+        o_w = torch.matmul(a_riw, k_ri) * (1.0 / math.sqrt(bands))
+        o_cat = o_w.reshape(batch, m_ch, padded_t, two_f)
+        if needs_pad:
+            o_cat = o_cat[:, :, shift : shift + frames, :]
+        tri = (
+            o_cat.reshape(batch, m_ch, frames, 2, bands)
+            .permute(0, 2, 4, 3, 1)
+            .reshape(batch, frames, bands, 2 * m_ch)
+        )
+        return self._finish_block_packed(x, tri, out_gate)
 
 
 class GlobalFreqTriangleRoPEBlock(TriangleRoPEBlock):
@@ -613,29 +774,34 @@ class GlobalFreqTriangleRoPEBlock(TriangleRoPEBlock):
     def forward(
         self, x: torch.Tensor, frame_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
+        batch, frames, bands, _dim = x.shape
         a, b, c, out_gate = self._project_abc(x)
-        a, b, c, valid = self._mask_abc(a, b, c, frame_mask)
+        a, b, c, valid = self._mask_abc_opt(a, b, c, frame_mask)
 
         a_r, a_i, b_r, b_i = self._apply_freq_rope(a, b)
-        c_0, c_1 = c.chunk(2, dim=-1)
+        m_ch = self.heads
+        a_ri = torch.cat((a_r, a_i), dim=1).permute(0, 3, 1, 2)  # [B, M, 2T, F]
+        b_ri = torch.cat((b_r, b_i), dim=1).permute(0, 3, 1, 2)  # [B, M, 2T, F]
 
-        a_r = a_r.permute(0, 3, 1, 2)
-        a_i = a_i.permute(0, 3, 1, 2)
-        b_r = b_r.permute(0, 3, 1, 2)
-        b_i = b_i.permute(0, 3, 1, 2)
-        c_0 = c_0.permute(0, 3, 1, 2)
-        c_1 = c_1.permute(0, 3, 1, 2)
+        inv_t: torch.Tensor | float = (
+            1.0 / frames if valid is None else self._global_inv_count(valid)
+        )
+        inv_val = inv_t if isinstance(inv_t, float) else inv_t.to(dtype=a_ri.dtype)
+        m = torch.matmul(a_ri.transpose(-2, -1), b_ri) * inv_val
+        attn = self._freq_attention(m, inv_t).to(dtype=c.dtype)
 
-        inv_t = self._global_inv_count(valid)
-        m = (
-            torch.matmul(a_r.transpose(-2, -1), b_r)
-            + torch.matmul(a_i.transpose(-2, -1), b_i)
-        ) * inv_t.to(dtype=a_r.dtype)
-        attn = self._freq_attention(m, inv_t).to(dtype=c_0.dtype)
-        c_freq = torch.cat((c_0, c_1), dim=-2)
+        c_freq = (
+            c.reshape(batch, frames, bands, 2, m_ch)
+            .permute(0, 4, 3, 1, 2)
+            .reshape(batch, m_ch, 2 * frames, bands)
+        )
         o_freq = torch.matmul(c_freq, attn.transpose(-2, -1))
-        o_0, o_1 = o_freq.chunk(2, dim=-2)
-        return self._finish_block(x, o_0, o_1, out_gate)
+        tri = (
+            o_freq.reshape(batch, m_ch, 2, frames, bands)
+            .permute(0, 3, 4, 2, 1)
+            .reshape(batch, frames, bands, 2 * m_ch)
+        )
+        return self._finish_block_packed(x, tri, out_gate)
 
 
 class WindowedFreqTriangleRoPEBlock(TriangleRoPEBlock):
@@ -681,61 +847,81 @@ class WindowedFreqTriangleRoPEBlock(TriangleRoPEBlock):
     ) -> torch.Tensor:
         batch, frames, bands, _dim = x.shape
         a, b, c, out_gate = self._project_abc(x)
-        a, b, c, valid = self._mask_abc(a, b, c, frame_mask)
+        a, b, c, valid = self._mask_abc_opt(a, b, c, frame_mask)
 
         a_r, a_i, b_r, b_i = self._apply_freq_rope(a, b)
-        c_0, c_1 = c.chunk(2, dim=-1)
-
-        a_r = a_r.permute(0, 3, 1, 2)
-        a_i = a_i.permute(0, 3, 1, 2)
-        b_r = b_r.permute(0, 3, 1, 2)
-        b_i = b_i.permute(0, 3, 1, 2)
-        c_0 = c_0.permute(0, 3, 1, 2)
-        c_1 = c_1.permute(0, 3, 1, 2)
-
+        m_ch = self.heads
         win = self.freq_window
         shift = self.window_shift
         pad_right = (-(frames + shift)) % win
-        pad_spec = (0, 0, shift, pad_right)
-        a_r = F.pad(a_r, pad_spec)
-        a_i = F.pad(a_i, pad_spec)
-        b_r = F.pad(b_r, pad_spec)
-        b_i = F.pad(b_i, pad_spec)
-        c_0 = F.pad(c_0, pad_spec)
-        c_1 = F.pad(c_1, pad_spec)
+        needs_pad = shift > 0 or pad_right > 0
+        if needs_pad:
+            pad_spec = (0, 0, 0, 0, shift, pad_right)
+            a_r = F.pad(a_r, pad_spec)
+            a_i = F.pad(a_i, pad_spec)
+            b_r = F.pad(b_r, pad_spec)
+            b_i = F.pad(b_i, pad_spec)
+            c = F.pad(c, pad_spec)
 
-        padded_t = a_r.shape[2]
+        padded_t = a_r.shape[1]
         num_win = padded_t // win
-        m_ch = a_r.shape[1]
 
-        a_rw = a_r.reshape(batch, m_ch, num_win, win, bands)
-        a_iw = a_i.reshape(batch, m_ch, num_win, win, bands)
-        b_rw = b_r.reshape(batch, m_ch, num_win, win, bands)
-        b_iw = b_i.reshape(batch, m_ch, num_win, win, bands)
+        a_riw = (
+            torch.stack(
+                (
+                    a_r.reshape(batch, num_win, win, bands, m_ch),
+                    a_i.reshape(batch, num_win, win, bands, m_ch),
+                ),
+                dim=2,
+            )
+            .permute(0, 5, 1, 2, 3, 4)
+            .reshape(batch, m_ch, num_win, 2 * win, bands)
+        )
+        b_riw = (
+            torch.stack(
+                (
+                    b_r.reshape(batch, num_win, win, bands, m_ch),
+                    b_i.reshape(batch, num_win, win, bands, m_ch),
+                ),
+                dim=2,
+            )
+            .permute(0, 5, 1, 2, 3, 4)
+            .reshape(batch, m_ch, num_win, 2 * win, bands)
+        )
 
-        inv_count = self._window_inv_counts(valid, shift, pad_right, win)
-        m = (
-            torch.matmul(a_rw.transpose(-2, -1), b_rw)
-            + torch.matmul(a_iw.transpose(-2, -1), b_iw)
-        ) * inv_count.to(dtype=a_rw.dtype)
-        attn = self._freq_attention(m, inv_count).to(dtype=c_0.dtype)
+        if valid is None:
+            if needs_pad:
+                valid_1 = torch.ones(1, frames, device=x.device)
+                inv_count: torch.Tensor | float = self._window_inv_counts(
+                    valid_1, shift, pad_right, win
+                )
+            else:
+                inv_count = 1.0 / win
+        else:
+            inv_count = self._window_inv_counts(valid, shift, pad_right, win)
 
-        c_w = torch.cat(
-            (
-                c_0.reshape(batch, m_ch, num_win, win, bands),
-                c_1.reshape(batch, m_ch, num_win, win, bands),
-            ),
-            dim=-2,
+        inv_val = (
+            inv_count
+            if isinstance(inv_count, float)
+            else inv_count.to(dtype=a_riw.dtype)
+        )
+        m = torch.matmul(a_riw.transpose(-2, -1), b_riw) * inv_val
+        attn = self._freq_attention(m, inv_count).to(dtype=c.dtype)
+
+        c_w = (
+            c.reshape(batch, num_win, win, bands, 2, m_ch)
+            .permute(0, 5, 1, 4, 2, 3)
+            .reshape(batch, m_ch, num_win, 2 * win, bands)
         )
         o_w = torch.matmul(c_w, attn.transpose(-2, -1))
-        o_0w, o_1w = o_w.chunk(2, dim=-2)
-        o_0 = o_0w.reshape(batch, m_ch, padded_t, bands)[
-            :, :, shift : shift + frames, :
-        ]
-        o_1 = o_1w.reshape(batch, m_ch, padded_t, bands)[
-            :, :, shift : shift + frames, :
-        ]
-        return self._finish_block(x, o_0, o_1, out_gate)
+        tri = (
+            o_w.reshape(batch, m_ch, num_win, 2, win, bands)
+            .permute(0, 2, 4, 5, 3, 1)
+            .reshape(batch, padded_t, bands, 2 * m_ch)
+        )
+        if needs_pad:
+            tri = tri[:, shift : shift + frames, :, :]
+        return self._finish_block_packed(x, tri, out_gate)
 
 
 class CausalFreqTriangleRoPEBlock(TriangleRoPEBlock):
@@ -800,53 +986,48 @@ class CausalFreqTriangleRoPEBlock(TriangleRoPEBlock):
         a, b, c, valid = self._mask_abc(a, b, c, frame_mask)
 
         a_r, a_i, b_r, b_i = self._apply_freq_rope(a, b)
-        c_0, c_1 = c.chunk(2, dim=-1)
-
-        a_r = a_r.permute(0, 3, 1, 2)
-        a_i = a_i.permute(0, 3, 1, 2)
-        b_r = b_r.permute(0, 3, 1, 2)
-        b_i = b_i.permute(0, 3, 1, 2)
-        c_0 = c_0.permute(0, 3, 1, 2)
-        c_1 = c_1.permute(0, 3, 1, 2)
-        m_ch = a_r.shape[1]
+        m_ch = self.heads
+        a_ri = torch.stack((a_r, a_i), dim=-1).permute(0, 3, 1, 2, 4)  # [B, M, T, F, 2]
+        b_ri = torch.stack((b_r, b_i), dim=-1).permute(0, 3, 1, 4, 2)  # [B, M, T, 2, F]
+        c_01 = c.reshape(batch, frames, bands, 2, m_ch).permute(
+            0, 4, 1, 2, 3
+        )  # [B, M, T, F, 2]
 
         log_gamma = (
             None
             if self.freq_decay_logit is None
             else F.logsigmoid(self.freq_decay_logit.float())
         )
-        state = torch.zeros(
-            batch, m_ch, bands, bands, device=x.device, dtype=torch.float32
-        )
-        count = torch.zeros(batch, m_ch, device=x.device, dtype=torch.float32)
-        outs_0: list[torch.Tensor] = []
-        outs_1: list[torch.Tensor] = []
+        use_cumsum = log_gamma is None
+        state: torch.Tensor | None = None
+        count: torch.Tensor | None = None
+        outs: list[torch.Tensor] = []
+
+        full_len = min(self.chunk_size, frames)
+        full_wc = _decay_weights(log_gamma, full_len, x.device)
 
         for start in range(0, frames, self.chunk_size):
             end = min(start + self.chunk_size, frames)
-            w, carry = _decay_weights(log_gamma, end - start, x.device)
-            delta = torch.einsum(
-                "bmlf,bmlg->bmlfg",
-                a_r[:, :, start:end].float(),
-                b_r[:, :, start:end].float(),
-            ) + torch.einsum(
-                "bmlf,bmlg->bmlfg",
-                a_i[:, :, start:end].float(),
-                b_i[:, :, start:end].float(),
+            chunk_len = end - start
+            w, carry = (
+                full_wc
+                if chunk_len == full_len
+                else _decay_weights(log_gamma, chunk_len, x.device)
+            )
+            delta = torch.matmul(
+                a_ri[:, :, start:end].float(), b_ri[:, :, start:end].float()
             )
             cum, n = _decayed_chunk_scan(
-                delta, valid[:, start:end], w, carry, state, count
+                delta, valid[:, start:end], w, carry, state, count, use_cumsum=use_cumsum
             )
             state = cum[:, :, -1]
             count = n[:, :, -1]
-            inv_n = 1.0 / n.clamp_min(1e-6)[..., None, None]
-            attn = self._freq_attention(cum * inv_n, inv_n).to(dtype=c_0.dtype)
-            outs_0.append(torch.einsum("bmlfg,bmlg->bmlf", attn, c_0[:, :, start:end]))
-            outs_1.append(torch.einsum("bmlfg,bmlg->bmlf", attn, c_1[:, :, start:end]))
+            attn = self._freq_attention_sum(cum, n).to(dtype=c.dtype)
+            outs.append(torch.matmul(attn, c_01[:, :, start:end]))
 
-        o_0 = outs_0[0] if len(outs_0) == 1 else torch.cat(outs_0, dim=2)
-        o_1 = outs_1[0] if len(outs_1) == 1 else torch.cat(outs_1, dim=2)
-        return self._finish_block(x, o_0, o_1, out_gate)
+        o_01 = outs[0] if len(outs) == 1 else torch.cat(outs, dim=2)
+        tri = o_01.permute(0, 2, 3, 4, 1).reshape(batch, frames, bands, 2 * m_ch)
+        return self._finish_block_packed(x, tri, out_gate)
 
 
 def _resolve_attn_heads(dim: int, heads: int | None) -> int:
@@ -936,8 +1117,7 @@ class RoPEAttentionBlock(nn.Module):
             return k, v
         batch_n = k.shape[0]
         sk = self.sink_k.to(dtype=k.dtype).expand(batch_n, -1, -1, -1)
-        sv = torch.zeros_like(sk)
-        return torch.cat((sk, k), dim=-2), torch.cat((sv, v), dim=-2)
+        return torch.cat((sk, k), dim=-2), F.pad(v, (0, 0, 1, 0))
 
 
 class TimeRoPEAttentionBlock(RoPEAttentionBlock):
@@ -1024,11 +1204,11 @@ class TimeRoPEAttentionBlock(RoPEAttentionBlock):
         h = self.attn_norm(x).permute(0, 2, 1, 3).reshape(batch * bands, frames, dim)
         q, k, v = self.qkv_proj(h).chunk(3, dim=-1)
         q = self.q_norm(
-            q.reshape(batch * bands, frames, self.heads, self.head_dim).transpose(1, 2)
-        )
+            q.reshape(batch * bands, frames, self.heads, self.head_dim)
+        ).transpose(1, 2)
         k = self.k_norm(
-            k.reshape(batch * bands, frames, self.heads, self.head_dim).transpose(1, 2)
-        )
+            k.reshape(batch * bands, frames, self.heads, self.head_dim)
+        ).transpose(1, 2)
         v = v.reshape(batch * bands, frames, self.heads, self.head_dim).transpose(1, 2)
 
         q, k = self.rope.apply_qk(q, k)
@@ -1038,13 +1218,10 @@ class TimeRoPEAttentionBlock(RoPEAttentionBlock):
         o = F.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
         )
-        o = (
-            o.transpose(1, 2)
-            .contiguous()
-            .reshape(batch, bands, frames, dim)
-            .permute(0, 2, 1, 3)
-        )
-        x = x + self.drop(self.out_proj(o))
+        o = self.out_proj(
+            o.transpose(1, 2).reshape(batch, bands, frames, dim)
+        ).permute(0, 2, 1, 3)
+        x = x + self.drop(o)
         ffn_gate, ffn_val = self.ffn_in(self.ffn_norm(x)).chunk(2, dim=-1)
         ffn = F.silu(ffn_gate) * ffn_val
         return x + self.drop(self.ffn_out(self.drop(ffn)))
@@ -1099,11 +1276,11 @@ class FreqRoPEAttentionBlock(RoPEAttentionBlock):
         h = self.attn_norm(x).reshape(batch * frames, bands, dim)
         q, k, v = self.qkv_proj(h).chunk(3, dim=-1)
         q = self.q_norm(
-            q.reshape(batch * frames, bands, self.heads, self.head_dim).transpose(1, 2)
-        )
+            q.reshape(batch * frames, bands, self.heads, self.head_dim)
+        ).transpose(1, 2)
         k = self.k_norm(
-            k.reshape(batch * frames, bands, self.heads, self.head_dim).transpose(1, 2)
-        )
+            k.reshape(batch * frames, bands, self.heads, self.head_dim)
+        ).transpose(1, 2)
         v = v.reshape(batch * frames, bands, self.heads, self.head_dim).transpose(1, 2)
 
         assert self.freq_cos is not None and self.freq_sin is not None
@@ -1111,7 +1288,7 @@ class FreqRoPEAttentionBlock(RoPEAttentionBlock):
         k, v = self._prepend_sink(k, v)
         dropout_p = self.dropout if self.training else 0.0
         o = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-        o = o.transpose(1, 2).contiguous().reshape(batch, frames, bands, dim)
+        o = o.transpose(1, 2).reshape(batch, frames, bands, dim)
         x = x + self.drop(self.out_proj(o))
         return x + self.hopfield_ffn(self.ffn_norm(x))
 

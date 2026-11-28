@@ -71,6 +71,7 @@ class HopfieldFFN(nn.Module):
         self.num_patterns = num_patterns
         self.num_steps = num_steps
         self.step_size = float(step_size)
+        self.dropout = float(dropout)
 
         self.in_proj = nn.Linear(dim, dim * 2, bias=False)
         self.keys = nn.Parameter(
@@ -104,50 +105,104 @@ class HopfieldFFN(nn.Module):
             std=(1.0 / math.sqrt(self.dim)) * residual_scale,
         )
 
-    def _attention_weights(
-        self,
-        xi_norm: torch.Tensor,
-        keys_t: torch.Tensor,
-        beta: torch.Tensor,
-    ) -> torch.Tensor:
-        logits = torch.matmul(xi_norm, keys_t).float() * beta
-        if self.sink_logit is None:
-            return F.softmax(logits, dim=-1)
-        sink = self.sink_logit.float().expand(logits.shape[0], logits.shape[1], 1)
-        return F.softmax(torch.cat((logits, sink), dim=-1), dim=-1)[..., :-1]
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         lead = x.shape[:-1]
         xi_raw, out_gate = self.in_proj(x).chunk(2, dim=-1)
-        xi = (
-            xi_raw.reshape(-1, self.num_heads, self.head_dim)
-            .transpose(0, 1)
-            .contiguous()
-        )  # [H, N, d_h]
+        if len(lead) >= 1:
+            b_outer = lead[0]
+            seq_inner = math.prod(lead[1:]) if len(lead) > 1 else 1
+        else:
+            b_outer = 1
+            seq_inner = 1
+
+        if self.num_heads == 1:
+            xi = xi_raw.reshape(b_outer, 1, seq_inner, self.head_dim)
+        else:
+            xi = (
+                xi_raw.reshape(b_outer, seq_inner, self.num_heads, self.head_dim)
+                .transpose(1, 2)
+                .contiguous()
+            )  # [B_outer, H, L, d_h]
         xi = F.normalize(xi.float(), dim=-1, eps=1e-6).to(dtype=x.dtype)
 
         keys = F.normalize(self.keys.float(), dim=-1, eps=1e-6).to(dtype=x.dtype)
-        keys_t = keys.transpose(-2, -1)  # [H, d_h, M]
         beta = (
             self.log_beta.float()
             .clamp(math.log(_BETA_MIN), math.log(_BETA_MAX))
             .exp()
+            .to(dtype=x.dtype)
         )
+        keys_scaled = keys * beta  # [H, M, d_h]
+        vals = self.values.to(dtype=x.dtype)
 
-        weights: torch.Tensor | None = None
+        has_sink = self.sink_logit is not None
+        pad_d = 0
+        if has_sink:
+            # Pad head_dim by at least 1 up to a multiple of 8 for FlashAttention alignment:
+            # Q is padded with 1.0, real keys with 0.0, and the appended sink key has
+            # sink_logit in its last coordinate (and 0.0 elsewhere) with a zero sink value,
+            # giving exact sink-softmax via fused SDPA without allocating [H, N, M] logits.
+            pad_d = 8 - (self.head_dim % 8)
+            d_ext = self.head_dim + pad_d
+            k_real = F.pad(keys_scaled, (0, pad_d))
+            k_sink = torch.zeros(
+                self.num_heads, 1, d_ext, device=x.device, dtype=x.dtype
+            )
+            k_sink[..., -1] = self.sink_logit.to(dtype=x.dtype).squeeze(-1)
+            k_all = (
+                torch.cat((k_real, k_sink), dim=-2)
+                .unsqueeze(0)
+                .expand(b_outer, -1, -1, -1)
+            )
+            v_keys = (
+                F.pad(keys, (0, pad_d, 0, 1))
+                .unsqueeze(0)
+                .expand(b_outer, -1, -1, -1)
+                if self.num_steps > 1
+                else None
+            )
+            v_vals = (
+                F.pad(vals, (0, pad_d, 0, 1))
+                .unsqueeze(0)
+                .expand(b_outer, -1, -1, -1)
+            )
+        else:
+            k_all = keys_scaled.unsqueeze(0).expand(b_outer, -1, -1, -1)
+            v_keys = (
+                keys.unsqueeze(0).expand(b_outer, -1, -1, -1)
+                if self.num_steps > 1
+                else None
+            )
+            v_vals = vals.unsqueeze(0).expand(b_outer, -1, -1, -1)
+
+        dropout_p = self.dropout if self.training else 0.0
+        out: torch.Tensor | None = None
         for step in range(self.num_steps):
             xi_norm = (
                 xi
                 if step == 0
                 else F.normalize(xi.float(), dim=-1, eps=1e-6).to(dtype=x.dtype)
             )
-            weights = self._attention_weights(xi_norm, keys_t, beta).to(dtype=x.dtype)
+            q_in = F.pad(xi_norm, (0, pad_d), value=1.0) if has_sink else xi_norm
             if step < self.num_steps - 1:
-                retrieved = torch.matmul(weights, keys)
-                xi = xi_norm + self.step_size * (retrieved - xi_norm)
+                assert v_keys is not None
+                retrieved = F.scaled_dot_product_attention(
+                    q_in, k_all, v_keys, scale=1.0
+                )
+                if has_sink:
+                    retrieved = retrieved[..., : self.head_dim]
+                if self.step_size == 1.0:
+                    xi = retrieved
+                else:
+                    xi = xi_norm + self.step_size * (retrieved - xi_norm)
+            else:
+                out = F.scaled_dot_product_attention(
+                    q_in, k_all, v_vals, dropout_p=dropout_p, scale=1.0
+                )
+                if has_sink:
+                    out = out[..., : self.head_dim]
 
-        assert weights is not None
-        out = torch.matmul(self.drop(weights), self.values.to(dtype=x.dtype))
-        out = out.transpose(0, 1).contiguous().reshape(*lead, self.dim)
+        assert out is not None
+        out = out.transpose(1, 2).reshape(*lead, self.dim)
         out = self.out_proj(self.out_norm(out)) * torch.sigmoid(out_gate)
         return self.drop(out)

@@ -62,7 +62,7 @@ def test_2d_layer_schedule() -> None:
         (TimeTriangleRoPEBlock, 0, 0),
         (TimeRoPEAttentionBlock, 0, 0),
         (TimeTriangleRoPEBlock, 0, 0),
-        (WindowedTimeTriangleRoPEBlock, 64, 0),
+        (WindowedTimeTriangleRoPEBlock, 64, 32),
         (TimeTriangleRoPEBlock, 0, 0),
         (TimeRoPEAttentionBlock, 0, 0),
     ]
@@ -449,3 +449,86 @@ def test_hybrid_parameters_receive_gradients(causal: bool) -> None:
     for name, param in tracked:
         assert param.grad is not None and torch.isfinite(param.grad).all(), name
         assert param.grad.abs().sum() > 0, name
+
+
+def test_checkpoint_works_when_input_has_no_grad() -> None:
+    torch.manual_seed(0)
+    model = TriangleRoFormer2D(
+        _band_freqs(6),
+        dim=32,
+        depth=4,
+        tri_dim=16,
+        use_checkpoint=True,
+        drop_path=0.0,
+        hopfield_patterns=16,
+    )
+    x = torch.randn(1, 8, 6, 32)  # requires_grad=False
+    y = model(x)
+    assert y.requires_grad
+    y.square().mean().backward()
+    grads = [p.grad for p in model.parameters() if p.requires_grad]
+    assert all(g is not None and torch.isfinite(g).all() for g in grads)
+    assert any(g.abs().sum() > 0 for g in grads)
+
+
+@pytest.mark.parametrize("attn_sink", [False, True])
+@pytest.mark.parametrize("step_size", [0.5, 1.0])
+def test_hopfield_ffn_matches_explicit_attention(
+    attn_sink: bool, step_size: float
+) -> None:
+    torch.manual_seed(0)
+    ffn = HopfieldFFN(
+        dim=48,
+        num_heads=3,
+        num_patterns=20,
+        num_steps=2,
+        step_size=step_size,
+        attn_sink=attn_sink,
+    ).eval()
+    x = torch.randn(2, 5, 4, 48)
+    y = ffn(x)
+
+    # Explicit reference without SDPA
+    xi_raw, out_gate = ffn.in_proj(x).chunk(2, dim=-1)
+    xi = xi_raw.reshape(-1, ffn.num_heads, ffn.head_dim).transpose(0, 1)
+    xi = torch.nn.functional.normalize(xi.float(), dim=-1, eps=1e-6)
+    keys = torch.nn.functional.normalize(ffn.keys.float(), dim=-1, eps=1e-6)
+    beta = ffn.log_beta.float().clamp(torch.log(torch.tensor(0.5)), torch.log(torch.tensor(32.0))).exp()
+    for step in range(ffn.num_steps):
+        xi_n = xi if step == 0 else torch.nn.functional.normalize(xi, dim=-1, eps=1e-6)
+        logits = torch.matmul(xi_n, keys.transpose(-2, -1)) * beta
+        if attn_sink:
+            sink = ffn.sink_logit.float().expand(logits.shape[0], logits.shape[1], 1)
+            weights = torch.softmax(torch.cat((logits, sink), dim=-1), dim=-1)[..., :-1]
+        else:
+            weights = torch.softmax(logits, dim=-1)
+        if step < ffn.num_steps - 1:
+            xi = xi_n + step_size * (torch.matmul(weights, keys) - xi_n)
+    out = torch.matmul(weights, ffn.values.float()).transpose(0, 1).reshape_as(x)
+    ref = ffn.out_proj(ffn.out_norm(out)) * torch.sigmoid(out_gate)
+    torch.testing.assert_close(y, ref, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("causal_decay", [False, True])
+def test_causal_time_matches_frame_by_frame_reference(causal_decay: bool) -> None:
+    torch.manual_seed(0)
+    block = TimeTriangleRoPEBlock(
+        dim=32, tri_dim=16, causal=True, chunk_size=3, causal_decay=causal_decay
+    ).eval()
+    x = torch.randn(2, 9, 5, 32)
+    mask = torch.ones(2, 9)
+    mask[1, 6:] = 0.0
+    # chunk_size=1 runs pure frame-by-frame recurrence; compare against chunk_size=3 and chunk_size=16
+    block_1 = TimeTriangleRoPEBlock(
+        dim=32, tri_dim=16, causal=True, chunk_size=1, causal_decay=causal_decay
+    ).eval()
+    block_1.load_state_dict(block.state_dict())
+    block_16 = TimeTriangleRoPEBlock(
+        dim=32, tri_dim=16, causal=True, chunk_size=16, causal_decay=causal_decay
+    ).eval()
+    block_16.load_state_dict(block.state_dict())
+    y3 = block(x, frame_mask=mask)
+    y1 = block_1(x, frame_mask=mask)
+    y16 = block_16(x, frame_mask=mask)
+    torch.testing.assert_close(y3, y1, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(y3, y16, atol=1e-5, rtol=1e-5)

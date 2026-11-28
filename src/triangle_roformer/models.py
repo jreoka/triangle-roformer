@@ -262,19 +262,23 @@ class TriangleRoFormer2D(nn.Module):
         """(window, shift) for time layer `idx`; window 0 = chunk-wide."""
         if causal or idx % 2 == 0:
             return 0, 0
-        shift = time_window // 2 if (idx // 2) % 2 == 1 else 0
+        # Windowed time layers occur at idx % 4 == 1 (idx % 4 == 3 is RoPE attention),
+        # so alternate shift by idx // 4 to actually move window seams across layers.
+        shift = time_window // 2 if (idx // 4) % 2 == 1 else 0
         return time_window, shift
 
-    def compile_layers(self, mode: str = "default") -> None:
+    def compile_layers(
+        self, mode: str = "default", dynamic: bool | None = False
+    ) -> None:
         _configure_dynamo_cache()
         if self.pre_block is not None:
-            self.pre_block.compile_layers(mode=mode)
+            self.pre_block.compile_layers(mode=mode, dynamic=dynamic)
         for unit in (*self.freq_layers, *self.time_layers):
-            compile_unit(unit, mode=mode)
+            compile_unit(unit, mode=mode, dynamic=dynamic)
         if self.geglu_fusion is not None:
-            compile_unit(self.geglu_fusion, mode=mode)
+            compile_unit(self.geglu_fusion, mode=mode, dynamic=dynamic)
         if self.post_block is not None:
-            self.post_block.compile_layers(mode=mode)
+            self.post_block.compile_layers(mode=mode, dynamic=dynamic)
 
     @staticmethod
     def _run_module(
@@ -331,9 +335,9 @@ class TriangleRoFormer2D(nn.Module):
             x = x.to(torch.get_autocast_dtype(x.device.type))
         if self.band_emb is not None:
             x = x + self.band_emb.to(dtype=x.dtype)
-        should_checkpoint = (
-            self.use_checkpoint and torch.is_grad_enabled() and x.requires_grad
-        )
+        # use_reentrant=False works even when input x.requires_grad is False
+        # (e.g. raw features / frozen frontend), so do not silently disable checkpointing.
+        should_checkpoint = self.use_checkpoint and torch.is_grad_enabled()
 
         if self.use_boundary_blocks:
             assert self.pre_block is not None

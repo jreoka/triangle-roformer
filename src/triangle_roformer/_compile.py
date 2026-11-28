@@ -40,11 +40,15 @@ def configure_dynamo_cache(limit: int = 64, accumulated_limit: int = 256) -> Non
                 setattr(dynamo_config, name, max(current, value))
 
 
-def compile_unit(module: nn.Module, mode: str = "default") -> None:
+def compile_unit(
+    module: nn.Module,
+    mode: str = "default",
+    dynamic: bool | None = False,
+) -> None:
     """Compile `module` for plain calls and, separately, a checkpointed call
     (checkpoint inside the compiled region) used by `run_unit` when
     activation checkpointing is on."""
-    module.compile(mode=mode, dynamic=False)
+    module.compile(mode=mode, dynamic=dynamic)
     forward = module.forward
 
     def checkpointed_call(*args: Any) -> Any:
@@ -54,7 +58,7 @@ def compile_unit(module: nn.Module, mode: str = "default") -> None:
     object.__setattr__(
         module,
         _COMPILED_CKPT_ATTR,
-        torch.compile(checkpointed_call, mode=mode, dynamic=False),
+        torch.compile(checkpointed_call, mode=mode, dynamic=dynamic),
     )
 
 

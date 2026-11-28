@@ -82,7 +82,7 @@ class ConvNeXtV2TemporalMixer(nn.Module):
                 (h.float().square() * valid).sum(dim=1, keepdim=True) / count
             ).add(1e-6).sqrt()
         nx = (gx / (gx.mean(dim=-1, keepdim=True) + 1e-6)).to(dtype=h.dtype)
-        h = h + self.grn_gamma.to(dtype=h.dtype) * (h * nx) + self.grn_beta.to(
+        h = h * (1.0 + self.grn_gamma.to(dtype=h.dtype) * nx) + self.grn_beta.to(
             dtype=h.dtype
         )
         return x + self.drop(self.pw_out(self.drop(h)))
@@ -153,10 +153,12 @@ class FineRateBoundaryBlock(nn.Module):
             causal_decay=causal_decay,
         )
 
-    def compile_layers(self, mode: str = "default") -> None:
-        compile_unit(self.temporal_mixer, mode=mode)
-        compile_unit(self.time_layer, mode=mode)
-        compile_unit(self.freq_layer, mode=mode)
+    def compile_layers(
+        self, mode: str = "default", dynamic: bool | None = False
+    ) -> None:
+        compile_unit(self.temporal_mixer, mode=mode, dynamic=dynamic)
+        compile_unit(self.time_layer, mode=mode, dynamic=dynamic)
+        compile_unit(self.freq_layer, mode=mode, dynamic=dynamic)
 
     @staticmethod
     def _run_unit(
